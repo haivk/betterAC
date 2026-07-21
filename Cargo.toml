@@ -1,0 +1,25 @@
+# Workspace root.
+#
+# The launcher used to be one crate. It is now three, split along the one line
+# that matters for a cross-platform port: what needs a GUI toolkit and what does
+# not.
+#
+#   core/  ac-core   platform-agnostic logic -- servers, config, the ACE/GDLE
+#                    argument shapes (the part with all the tests), install
+#                    discovery, and the setup state machine. No GTK, no Cocoa;
+#                    compiles and tests on Linux and macOS alike.
+#   gtk/   betterac  the Linux binary: GTK4/libadwaita on top of ac-core.
+#   ffi/   ac-ffi    a C ABI over ac-core for the macOS SwiftUI app (macOS only).
+#
+# Keeping the risky logic (the two client argument shapes) in one tested crate
+# is the whole point: both frontends get the same, proven code rather than a
+# reimplementation each.
+[workspace]
+resolver = "2"
+members = ["core", "gtk", "ffi"]
+
+# Applied to every crate in the workspace. Same knobs the single crate used.
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

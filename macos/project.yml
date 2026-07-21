@@ -1,0 +1,127 @@
+# xcodegen spec for the macOS SwiftUI launcher.
+#
+#   brew install xcodegen        # once
+#   cd betterAC/macos && xcodegen # regenerates BetterAC.xcodeproj
+#
+# Everything below is wired already: a pre-build phase rebuilds the Rust
+# staticlib, the linker pulls it in with -lac_ffi (the ONLY flag needed — proven
+# by linking a C probe against it), the bridging header exposes ac_ffi.h to
+# Swift, and the Wine entitlements are generated into BetterAC.entitlements.
+name: BetterAC
+
+options:
+  bundleIdPrefix: ac.betterac
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Universal. The app itself is native on both Macs; the Wine engine it drives
+    # is an x86_64 build either way (native on Intel, Rosetta-translated on Apple
+    # Silicon), so Intel support costs nothing but the second slice. The pre-build
+    # script below builds a matching Rust staticlib per arch and lipos them.
+    ARCHS: "arm64 x86_64"
+    PRODUCT_BUNDLE_IDENTIFIER: ac.betterac.BetterAC
+    # Find ac_ffi.h (imported by the bridging header) and libac_ffi.a.
+    HEADER_SEARCH_PATHS:
+      - $(SRCROOT)/../ffi/include
+    LIBRARY_SEARCH_PATHS:
+      - $(SRCROOT)/../target/universal/release
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/BetterAC-Bridging-Header.h
+    OTHER_LDFLAGS:
+      - -lac_ffi
+      # ac-core's macOS launch path queries the display via CoreGraphics to size
+      # AC's window; Xcode links the .a directly so it won't honour the Rust
+      # #[link] directive — name the framework explicitly.
+      - -framework
+      - CoreGraphics
+  configs:
+    # Day-to-day ⌘R builds only this Mac's arch, so a dev never needs a
+    # cross-compiling toolchain installed. Release builds both slices.
+    Debug:
+      ONLY_ACTIVE_ARCH: "YES"
+    Release:
+      ONLY_ACTIVE_ARCH: "NO"
+
+targets:
+  BetterAC:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleName: BetterAC
+        CFBundleDisplayName: BetterAC
+        LSMinimumSystemVersion: "13.0"
+        LSApplicationCategoryType: public.app-category.games
+        NSHighResolutionCapable: true
+    entitlements:
+      path: BetterAC.entitlements
+      properties:
+        # Wine's JIT/code-gen needs these; the app is deliberately NOT sandboxed
+        # (a sandboxed app cannot spawn and drive an external Wine engine). This
+        # matches how CrossOver/Whisky ship.
+        com.apple.security.cs.allow-jit: true
+        com.apple.security.cs.allow-unsigned-executable-memory: true
+        com.apple.security.cs.disable-library-validation: true
+    preBuildScripts:
+      - name: Build ac-ffi (Rust)
+        basedOnDependencyAnalysis: false
+        script: |
+          # Build one Rust staticlib per arch Xcode asked for, then lipo them into
+          # the single libac_ffi.a the linker picks up from LIBRARY_SEARCH_PATHS.
+          # $ARCHS is one arch for a Debug build (ONLY_ACTIVE_ARCH) and both for
+          # Release, so this covers the universal case without slowing down ⌘R.
+          set -euo pipefail
+          # Xcode build phases get a sanitized PATH, so cargo has to be added.
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          cd "$SRCROOT/.."
+
+          # cbindgen pulls clap_lex, which needs edition 2024 / Rust >= 1.85.
+          new_enough() {
+            v="$("$1" --version 2>/dev/null | awk '{print $2}')" || return 1
+            [ -n "$v" ] && [ "$(printf '%s\n1.85.0\n' "$v" | sort -V | head -1)" = "1.85.0" ]
+          }
+
+          # Prefer rustup's cargo when it is new enough: it is the ONLY one that can
+          # cross-compile, because Homebrew's rust ships std for the host alone and
+          # is not rustup-managed (so `rustup target add` cannot help it). Homebrew
+          # is the fallback, which is fine for a host-arch-only build.
+          CARGO=""
+          for c in "$HOME/.cargo/bin/cargo" /opt/homebrew/bin/cargo /usr/local/bin/cargo; do
+            if [ -x "$c" ] && new_enough "$c"; then CARGO="$c"; break; fi
+          done
+          if [ -z "$CARGO" ]; then
+            echo "error: no cargo >= 1.85 found (cbindgen needs edition 2024)." >&2
+            echo "       fix: rustup update stable" >&2
+            exit 1
+          fi
+          # cargo finds `rustc` on PATH, so the chosen cargo's own bin dir must come
+          # first — otherwise rustup's cargo drives Homebrew's rustc, which has std
+          # for the host alone and fails cross-compiling with a misleading
+          # "can't find crate for core / target may not be installed".
+          export PATH="$(dirname "$CARGO"):$PATH"
+
+          OUT="target/universal/release"
+          mkdir -p "$OUT"
+          SLICES=""
+          for arch in $ARCHS; do
+            case "$arch" in
+              arm64)  triple=aarch64-apple-darwin ;;
+              x86_64) triple=x86_64-apple-darwin ;;
+              *) echo "warning: skipping unknown arch $arch" >&2; continue ;;
+            esac
+            if ! "$CARGO" build --release -p ac-ffi --target "$triple"; then
+              echo "error: could not build ac-ffi for $triple." >&2
+              echo "       if the target's std is missing: rustup target add $triple" >&2
+              echo "       (and note Homebrew's rust cannot cross-compile at all)" >&2
+              exit 1
+            fi
+            SLICES="$SLICES target/$triple/release/libac_ffi.a"
+          done
+          lipo -create $SLICES -output "$OUT/libac_ffi.a"
+          lipo -archs "$OUT/libac_ffi.a"

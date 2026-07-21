@@ -1,0 +1,30 @@
+[package]
+name = "ac-core"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-agnostic core for the Asheron's Call launcher: servers, config, client argument shapes, install discovery, and setup."
+license = "MIT"
+
+# No GUI toolkit here, on purpose. This crate must build on both the Linux host
+# (where the GTK frontend links it) and macOS (where the SwiftUI app links it
+# through ac-ffi), so it depends on nothing platform-specific. Display-resolution
+# detection, which does need a toolkit, lives in the frontends and is passed in.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json", "tls"] }
+dirs = "5"
+# Setup provisions the runtime and applies updates: GE-Proton ships as .tar.gz,
+# the End-of-Retail update as .zip. Pure-Rust backends so this still builds on
+# macOS (where the setup steps that shell out to umu-run are simply never run).
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Verify the integrity of large downloads (the ~317 MB Wine engine) against a
+# known SHA-256 before unpacking, so a truncated or corrupt fetch fails loudly
+# rather than producing a half-broken runtime.
+sha2 = "0.10"
+
+[lib]
+name = "ac_core"
+path = "src/lib.rs"

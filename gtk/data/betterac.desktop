@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Asheron's Call
+GenericName=Game Launcher
+Comment=Launch Asheron's Call on a player server
+Exec=betterac
+Icon=ac.betterac.BetterAC
+Terminal=false
+Categories=Game;RolePlaying;
+Keywords=asheron;ac;mmo;thwargle;
+StartupNotify=true
+StartupWMClass=betterac
