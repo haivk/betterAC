@@ -1,0 +1,69 @@
+# Build and test on both platforms, on every push and PR.
+#
+# The Linux job is the one that catches most breakage, because the GTK frontend
+# only compiles there. The macOS job guards the other half: the FFI, the Swift
+# app, and the universal build.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # gtk4-rs links against the system toolkit; without these the betterac
+      # crate cannot build at all.
+      - name: Install GTK4 and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Deliberately no `cargo fmt --check`. The formatting here is hand-tuned in
+      # places where it carries meaning -- core/src/args.rs lays the client
+      # arguments out as flag/value pairs per line, which rustfmt would explode
+      # into one token per line. The workspace is clippy-clean, so that is the
+      # gate worth enforcing. If you ever want the fmt gate, run `cargo fmt` once
+      # and add a rustfmt.toml in the same commit.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release -p betterac
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both slices, so a change that breaks the Intel build is caught here
+          # rather than at release time.
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test -p ac-core
+      - run: cargo test -p ac-core --target x86_64-apple-darwin
+
+      - run: brew install xcodegen
+
+      # Unsigned: signing identities live only in the release workflow. This
+      # proves the Swift app and the bridging header still compile against the
+      # current FFI.
+      - name: Build the macOS app (unsigned)
+        run: |
+          cd macos
+          xcodegen
+          xcodebuild -project BetterAC.xcodeproj -scheme BetterAC \
+            -configuration Debug CODE_SIGNING_ALLOWED=NO build

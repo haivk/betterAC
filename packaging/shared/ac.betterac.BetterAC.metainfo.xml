@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata. One file, three consumers: the .deb installs it under
+  /usr/share/metainfo so GNOME Software and KDE Discover can describe the app,
+  the AUR package does the same, and a Flatpak build requires it outright.
+
+  @@VERSION@@ and @@DATE@@ are filled in by packaging/render-metadata.sh at
+  release time, so the <release> entry always matches the tag being built.
+
+  Note there are no <screenshots>: Flathub requires them, and this is not going
+  to Flathub yet (see packaging/flatpak/). Adding a screenshot means hosting the
+  image at a stable URL first, so it is deliberately left out rather than
+  pointed at something that will 404.
+-->
+<component type="desktop-application">
+  <id>ac.betterac.BetterAC</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Asheron's Call</name>
+  <summary>Launcher for Asheron's Call player servers</summary>
+
+  <description>
+    <p>
+      betterAC is a native launcher for Asheron's Call, the 1999 MMO, which lives
+      on through community-run servers. It browses the live server directory,
+      remembers an account per server, and launches the Windows client through
+      Proton — replacing ThwargLauncher, which is itself a Windows app and so had
+      to run inside the same Wine prefix as the game.
+    </p>
+    <p>
+      On first run it sets itself up: it downloads the Windows runtime, the retail
+      client and the End-of-Retail update, then installs them, showing each step
+      with its own progress. You only do that once.
+    </p>
+    <p>
+      Launching the game needs umu-launcher on your system. gamescope and
+      winetricks are used when present.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">ac.betterac.BetterAC.desktop</launchable>
+  <categories>
+    <category>Game</category>
+    <category>RolePlaying</category>
+  </categories>
+
+  <url type="homepage">https://github.com/haivk/betterAC</url>
+  <url type="bugtracker">https://github.com/haivk/betterAC/issues</url>
+
+  <provides>
+    <binary>betterac</binary>
+  </provides>
+
+  <!-- No ads, no gambling, no in-app purchases; the game itself is another
+       matter, and this is metadata about the launcher. -->
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="@@VERSION@@" date="@@DATE@@"/>
+  </releases>
+</component>

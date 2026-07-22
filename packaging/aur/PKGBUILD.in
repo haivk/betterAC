@@ -1,0 +1,55 @@
+# Maintainer: haivk <hank@haivk.com>
+#
+# AUR package for betterAC. Rendered by packaging/render-metadata.sh with the
+# version and the release tarball's SHA-256 filled in.
+#
+# This is the -bin package: it repackages the prebuilt release tarball rather
+# than compiling. That is the fastest thing to publish and needs no build
+# dependencies. A from-source `betterac` package (makedepends: rust, gtk4,
+# libadwaita) can follow once this one is proven.
+#
+# To publish:
+#   git clone ssh://aur@aur.archlinux.org/betterac-bin.git
+#   cp PKGBUILD .SRCINFO betterac-bin/ && cd betterac-bin
+#   git commit -am "betterac-bin @@VERSION@@" && git push
+pkgname=betterac-bin
+pkgver=@@VERSION@@
+pkgrel=1
+pkgdesc="Launcher for Asheron's Call player servers"
+arch=('x86_64')
+url="https://github.com/haivk/betterAC"
+license=('MIT')
+
+# Only the toolkit is a hard dependency -- that is all the launcher itself links.
+depends=('gtk4' 'libadwaita')
+
+# The tools it drives. umu-launcher is required to actually launch the game
+# (core/src/proton.rs refuses to finish setup without it), but it is an optdepend
+# rather than a depend so the launcher can still be installed and configured on a
+# machine where you are setting things up in a different order.
+optdepends=(
+  'umu-launcher: required to launch the game'
+  'gamescope: correct fullscreen scaling (strongly recommended)'
+  'winetricks: installs the runtime components the client needs'
+)
+
+provides=('betterac')
+conflicts=('betterac')
+
+source=("$pkgname-$pkgver.tar.gz::https://github.com/haivk/betterAC/releases/download/v$pkgver/betterac-$pkgver-x86_64.tar.gz")
+sha256sums=('@@TARBALL_SHA256@@')
+
+package() {
+  cd "$srcdir/betterac-$pkgver-x86_64"
+
+  install -Dm755 betterac "$pkgdir/usr/bin/betterac"
+  install -Dm644 data/betterac.desktop \
+    "$pkgdir/usr/share/applications/ac.betterac.BetterAC.desktop"
+  install -Dm644 data/betterac.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/ac.betterac.BetterAC.svg"
+  install -Dm644 data/ac.betterac.BetterAC.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/ac.betterac.BetterAC.metainfo.xml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  # MIT is not one of /usr/share/licenses/common, so the text must ship.
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

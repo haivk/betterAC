@@ -1,0 +1,221 @@
+# Cut a release from a tag: build every artifact, sign and notarize the Mac app,
+# render the package-manager metadata, and publish a GitHub Release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The real work lives in packaging/*.sh so it can be run and debugged on a
+# developer machine instead of only inside Actions. Steps here stay one-liners.
+#
+# Required repository secrets (see packaging/README.md):
+#   APPLE_CERT_P12         base64 of the Developer ID Application .p12
+#   APPLE_CERT_PASSWORD    password for that .p12
+#   APPLE_SIGN_IDENTITY    e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID               Apple ID email used for notarization
+#   APPLE_APP_PASSWORD     app-specific password for that Apple ID
+#   APPLE_TEAM_ID          10-character team identifier
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail in seconds rather than after a 20-minute build: a tag that disagrees
+  # with the workspace version would ship a cask, PKGBUILD and AppStream entry
+  # that all describe a different build than the binary inside them.
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "Manual run; workspace version is $CARGO_VERSION"
+            exit 0
+          fi
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $CARGO_VERSION"
+            echo "Bump [workspace.package] version in Cargo.toml, or retag."
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches workspace version $CARGO_VERSION"
+
+  macos:
+    needs: version-check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xcodegen
+
+      # A throwaway keychain, so the signing identity never touches the runner's
+      # login keychain and is gone whatever happens below.
+      - name: Import the Developer ID certificate
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign blocks on a UI prompt that no one can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build, sign, notarize, staple
+        env:
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          NOTARIZE: "1"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./packaging/macos/build-dmg.sh
+
+      - name: Delete the temporary keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  linux:
+    needs: version-check
+    # 22.04, not latest: the binary links the host's glibc, so the build box sets
+    # the floor for every user. Same reasoning as gtk/install.sh:9-11.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4 and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: ./packaging/linux/build-tarball.sh
+
+      - name: Build the .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p betterac --no-build --output dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+          if-no-files-found: error
+
+  # Best effort, never blocks a release -- the manifest is a scaffold and says so
+  # at the top. If it builds, the bundle rides along; if it doesn't, the release
+  # still happens.
+  flatpak:
+    needs: version-check
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: betterac.flatpak
+          manifest-path: packaging/flatpak/ac.betterac.BetterAC.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: betterac.flatpak
+          if-no-files-found: warn
+
+  release:
+    needs: [version-check, macos, linux]
+    # Tags only. On a workflow_dispatch run GITHUB_REF_NAME is the branch, so the
+    # publish step below would happily create a release literally named "main".
+    # A manual run is for rehearsing the builds; the artifacts are on the run page.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find staging -type f \( -name '*.dmg' -o -name '*.tar.gz' \
+            -o -name '*.deb' -o -name '*.flatpak' \) -exec mv {} dist/ \;
+          ls -la dist/
+
+      # VERSION comes from the tag check, so this job needs no Rust toolchain.
+      - name: Render package metadata
+        env:
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: ./packaging/render-metadata.sh dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## betterAC $VERSION"
+            echo
+            echo "### Install"
+            echo '```sh'
+            echo "# macOS (signed + notarized)"
+            echo "brew tap haivk/betterac && brew install --cask betterac"
+            echo
+            echo "# Arch"
+            echo "yay -S betterac-bin"
+            echo
+            echo "# Debian/Ubuntu  (also needs umu-launcher, which Debian does not package)"
+            echo "sudo dpkg -i betterac_${VERSION}_amd64.deb"
+            echo '```'
+            echo
+            echo "### Checksums"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "The rendered \`betterac.rb\` (Homebrew cask), \`PKGBUILD\` and"
+            echo "\`.SRCINFO\` are attached: copy them into the tap and AUR repos."
+          } > notes.md
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "betterAC $VERSION" \
+            --notes-file notes.md \
+            dist/*.dmg dist/*.tar.gz dist/*.deb \
+            dist/betterac.rb dist/PKGBUILD dist/.SRCINFO dist/SHA256SUMS

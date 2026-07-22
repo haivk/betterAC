@@ -1,0 +1,105 @@
+# Flatpak manifest for betterAC.
+#
+# STATUS: the LAUNCHER builds and runs from this. It browses servers, shows the
+# setup checklist, and saves config. It cannot yet set up or launch the game --
+# see "What is still missing" below. The release workflow treats the Flatpak job
+# as best-effort (continue-on-error) so this never blocks a release.
+#
+# Build and install it on a Linux box (NOT possible on macOS):
+#
+#   ./packaging/flatpak/build-local.sh
+#
+# ---------------------------------------------------------------- local vs Flathub
+#
+# This manifest is in its LOCAL-ITERATION form: the build has network access and
+# lets cargo fetch crates normally. Flathub forbids that -- a submission needs
+# `--offline` plus a generated cargo-sources.json listing every crate. Doing that
+# now would mean regenerating a 1000-line lockfile mirror on every dependency
+# bump, for a package that is not ready to submit. The switch is:
+#
+#   1. python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
+#   2. add it under sources, and restore CARGO_NET_OFFLINE=true + --offline
+#   3. drop the --share=network build-arg below
+#
+# ------------------------------------------------------- What is still missing
+#
+#   1. The launcher's job is to drive HOST tools. core/src/proton.rs refuses to
+#      finish setup unless umu-run, gamescope and winetricks are on PATH, and
+#      launching runs `umu-run acclient.exe`. Inside a sandbox, PATH is the
+#      runtime's, so none of them are there. gtk/install.sh:19-22 argues this app
+#      should not be a Flatpak at all for exactly this reason.
+#
+#   2. Bundling umu-launcher is not just "add a module": umu-run itself runs
+#      pressure-vessel, which is bwrap -- a NESTED container inside the Flatpak
+#      sandbox. That is the hard part, and it is what took Valve real work to make
+#      Steam's Flatpak function. Expect to need --allow=devel, --device=all, and
+#      to fight nested user namespaces.
+#
+#   3. gamescope has no extension for org.gnome.Platform (the one that exists,
+#      com.valvesoftware.Steam.Utility.gamescope, is keyed to the Steam Flatpak's
+#      freedesktop runtime). Bundling it means building it here against Vulkan,
+#      wayland and libdrm.
+#
+#   4. GE-Proton is downloaded at runtime into core/src/install.rs::steam_compat()
+#      = ~/.local/share/Steam/compatibilitytools.d. With --filesystem=home below
+#      that IS the real path, so a Flatpak build shares GE-Proton with the host's
+#      Steam rather than duplicating 400 MB into ~/.var/app. That is the reason
+#      for the broad filesystem permission; narrowing it means duplicating.
+#
+# The other route is --talk-name=org.freedesktop.Flatpak plus flatpak-spawn --host
+# to run the host's tools. It works and it is much less code, but it is sandbox
+# escape by another name, and Flathub reviewers treat it as such.
+id: ac.betterac.BetterAC
+runtime: org.gnome.Platform
+runtime-version: "48"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: betterac
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/betterac/cargo
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # The server directory comes from treestats, and setup downloads the runtime
+  # and the game files.
+  - --share=network
+  # The prefix (~/Games/asherons-call) and GE-Proton
+  # (~/.local/share/Steam/compatibilitytools.d) are host paths the launcher owns.
+  # See note 4 above: this is what keeps GE-Proton shared with Steam.
+  - --filesystem=home
+
+modules:
+  - name: betterac
+    buildsystem: simple
+    build-options:
+      # Local-iteration only; see the note at the top of this file.
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release -p betterac
+      - install -Dm755 target/release/betterac /app/bin/betterac
+      - install -Dm644 gtk/data/betterac.desktop
+        /app/share/applications/ac.betterac.BetterAC.desktop
+      - install -Dm644 gtk/data/betterac.svg
+        /app/share/icons/hicolor/scalable/apps/ac.betterac.BetterAC.svg
+      - install -Dm644 packaging/shared/ac.betterac.BetterAC.metainfo.xml
+        /app/share/metainfo/ac.betterac.BetterAC.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        # Without these, flatpak-builder copies the entire tree into the build
+        # sandbox -- including target/, which is several GB, and macos/, which is
+        # irrelevant here. This is the difference between a 30-second copy and a
+        # very long one.
+        skip:
+          - target
+          - dist
+          - macos
+          - .git

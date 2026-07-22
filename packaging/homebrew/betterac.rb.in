@@ -1,0 +1,36 @@
+# Homebrew cask for betterAC. Rendered by packaging/render-metadata.sh, which
+# fills in the version and the DMG's SHA-256 from the release being built.
+#
+# This goes in a personal tap, not homebrew-cask: upstream has notability
+# requirements (stars/forks/age) that a fresh repo will not meet. Create the tap
+# once, as a GitHub repo named `homebrew-betterac`, then:
+#
+#   cp betterac.rb <tap>/Casks/betterac.rb   # this file, rendered
+#   brew tap haivk/betterac
+#   brew install --cask betterac
+#
+# No `--no-quarantine` anywhere on purpose: the DMG is signed with a Developer ID
+# and notarized, so Gatekeeper lets it open normally. If you ever ship an
+# unsigned build, this cask will install an app macOS then refuses to launch.
+cask "betterac" do
+  version "@@VERSION@@"
+  sha256 "@@DMG_SHA256@@"
+
+  url "https://github.com/haivk/betterAC/releases/download/v#{version}/BetterAC-#{version}-universal.dmg",
+      verified: "github.com/haivk/betterAC/"
+  name "betterAC"
+  desc "Launcher for Asheron's Call player servers"
+  homepage "https://github.com/haivk/betterAC"
+
+  # Matches the app's macOS 13.0 deployment target.
+  depends_on macos: ">= :ventura"
+
+  app "BetterAC.app"
+
+  # First run provisions a Wine engine, the retail client and the End-of-Retail
+  # update into Application Support -- several gigabytes. Uninstalling the app
+  # without this leaves all of it behind.
+  zap trash: [
+    "~/Library/Application Support/betterac",
+  ]
+end
