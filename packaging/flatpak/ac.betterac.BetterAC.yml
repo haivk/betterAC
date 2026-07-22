@@ -89,7 +89,10 @@ modules:
         /app/share/applications/ac.betterac.BetterAC.desktop
       - install -Dm644 gtk/data/betterac.svg
         /app/share/icons/hicolor/scalable/apps/ac.betterac.BetterAC.svg
-      - install -Dm644 packaging/shared/ac.betterac.BetterAC.metainfo.xml
+      # Rendered, not copied: packaging/shared/ is a template carrying
+      # @@VERSION@@/@@DATE@@ in its <release> element, and flatpak-builder
+      # validates the metainfo it finds. Derives the version from cargo.
+      - ./packaging/render-metainfo.sh
         /app/share/metainfo/ac.betterac.BetterAC.metainfo.xml
     sources:
       - type: dir

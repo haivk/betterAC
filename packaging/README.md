@@ -8,8 +8,10 @@ inside GitHub Actions.
 |---|---|
 | `macos/build-dmg.sh` | universal `.app` → sign → `.dmg` → notarize → staple |
 | `linux/build-tarball.sh` | binary + desktop + icon + metainfo → `.tar.gz` |
+| `source-tarball.sh` | `git archive` of the tagged tree → `-src.tar.gz`, what the Linux formula builds |
 | `render-metadata.sh` | fills the templates below with the version and real SHA-256s |
-| `homebrew/betterac.rb.in` | Homebrew cask template |
+| `homebrew/betterac.rb.in` | Homebrew **cask** template — macOS, ships the `.dmg` |
+| `homebrew/betterac-formula.rb.in` | Homebrew **formula** template — Linux, builds from source |
 | `aur/PKGBUILD.in` | AUR `betterac-bin` template |
 | `shared/*.metainfo.xml` | AppStream metadata (used by the `.deb`, AUR and Flatpak) |
 | `flatpak/*.yml` | Flatpak manifest — **a scaffold**, see the header in that file |
@@ -54,15 +56,36 @@ an `if: always()` step, so it never lands in the runner's login keychain.
 Both are deliberate — while things are still moving, it is better to look at the
 rendered file before it goes live.
 
-**Homebrew.** One-time: create a GitHub repo named `homebrew-betterac`. Then per
-release, take `betterac.rb` off the release page:
+**Homebrew.** One-time: create a GitHub repo named `homebrew-betterac`. The tap
+serves both platforms from one repo — a cask for macOS and a formula for Linux —
+so each release copies **two** files into **two** directories:
 
 ```sh
-cp betterac.rb <tap>/Casks/betterac.rb
+cp betterac.rb          <tap>/Casks/betterac.rb      # macOS: the signed .dmg
+cp betterac-formula.rb  <tap>/Formula/betterac.rb    # Linux: builds from source
 cd <tap> && git commit -am "betterac 0.2.0" && git push
 # users:
-brew tap haivk/betterac && brew install --cask betterac
+brew tap haivk/betterac
+brew install --cask betterac   # macOS
+brew install betterac          # Linux
 ```
+
+Note the rename: both render out of `dist/` and the cask already owns
+`betterac.rb` there, so the formula is written as `betterac-formula.rb` and only
+stops colliding once the two are in different tap directories.
+
+**`--cask` is not optional on macOS.** Homebrew resolves a formula before a
+same-named cask, so a bare `brew install betterac` on a Mac lands on the Linux
+formula and stops at `depends_on :linux` with `Error: betterac: Linux is
+required.` That is the accepted cost of one name on both platforms.
+
+The Linux formula builds from source rather than repackaging the release
+tarball, because the two link different toolkits: the release binary resolves
+gtk4 from the distro (needing ≥ 4.12, which a formula cannot declare or
+enforce), while the formula links Homebrew's own. Homebrew bottles `gtk4` and
+`libadwaita` for `x86_64_linux` and `arm64_linux`, so only betterAC itself
+compiles — and Linux arm64 comes free, which the x86_64-only binary tarball
+cannot offer.
 
 This is a personal tap rather than homebrew-cask because upstream has notability
 requirements (stars, forks, age) a new repo will not meet.
@@ -84,15 +107,44 @@ check, the DMG and the verification:
 
 ```sh
 ./packaging/macos/build-dmg.sh                     # → dist/BetterAC-<ver>-universal.dmg
-./packaging/render-metadata.sh dist                # → cask, PKGBUILD, .SRCINFO, SHA256SUMS
+./packaging/source-tarball.sh dist                 # → dist/betterac-<ver>-src.tar.gz
+./packaging/render-metadata.sh dist                # → cask, formula, PKGBUILD, .SRCINFO, SHA256SUMS
+ruby -c dist/betterac.rb && ruby -c dist/betterac-formula.rb
 ```
+
+`source-tarball.sh` runs anywhere with git — it packs `HEAD`, not your working
+tree, so commit before rehearsing or you will checksum the wrong thing. It says
+so when the tree is dirty.
 
 Gatekeeper is *expected* to reject an ad-hoc build; the script says so rather
 than failing. It does fail if a notarized build is rejected, which is the case
 that must never ship.
 
-The Linux scripts need a Linux box (gtk4 + libadwaita development files). They
-cannot run on macOS at all.
+`linux/build-tarball.sh` needs a Linux box (gtk4 + libadwaita development
+files); it cannot run on macOS at all.
+
+### Testing the Linux formula before a release exists
+
+The formula's `url` points at a release asset, so a rendered formula cannot be
+installed until that release is published. To test one first, point it at the
+local tarball — Homebrew accepts `file://`:
+
+```sh
+./packaging/source-tarball.sh dist
+scp dist/betterac-<ver>-src.tar.gz <linuxbox>:
+# on the box, in a copy of the rendered formula:
+#   url    "file:///home/<user>/betterac-<ver>-src.tar.gz"
+#   sha256 "<sha256sum of that file>"
+brew install --build-from-source ./betterac.rb
+brew audit --strict --formula ./betterac.rb
+brew linkage --test betterac    # must not list any system gtk4
+betterac --version              # what the formula's test block runs
+betterac                        # the check that matters: GUI, schemas, icons
+```
+
+Launching the GUI is the part worth doing by hand. It is what proves the
+`XDG_DATA_DIRS` wrapper in the formula is enough — without it the binary cannot
+find gtk4's GSettings schemas under the Homebrew prefix and aborts at startup.
 
 ## Debian/Ubuntu caveat
 

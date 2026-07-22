@@ -4,8 +4,15 @@
   /usr/share/metainfo so GNOME Software and KDE Discover can describe the app,
   the AUR package does the same, and a Flatpak build requires it outright.
 
-  @@VERSION@@ and @@DATE@@ are filled in by packaging/render-metadata.sh at
-  release time, so the <release> entry always matches the tag being built.
+  THIS IS A TEMPLATE. Do not install it directly: @@VERSION@@ and @@DATE@@ are
+  filled in by packaging/render-metainfo.sh, which every consumer runs, so the
+  <release> entry always matches the version being built. Installing this file
+  as-is ships a literal "@@VERSION@@", which is invalid AppStream.
+  (render-metadata.sh renders a copy too, but that one is for the release page:
+  it runs after the packages have already been built.)
+
+  Note for editors: XML forbids a doubled hyphen inside a comment, so the dash
+  convention used everywhere else in this project cannot be written in here.
 
   Note there are no <screenshots>: Flathub requires them, and this is not going
   to Flathub yet (see packaging/flatpak/). Adding a screenshot means hosting the

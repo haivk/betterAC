@@ -105,9 +105,13 @@ jobs:
 
   linux:
     needs: version-check
-    # 22.04, not latest: the binary links the host's glibc, so the build box sets
-    # the floor for every user. Same reasoning as gtk/install.sh:9-11.
-    runs-on: ubuntu-22.04
+    # The binary links the host's glibc, so the build box sets the floor for
+    # every user -- normally an argument for the oldest runner available. 24.04
+    # is the oldest that can build this at all: the v4_12/v1_5 feature gates in
+    # gtk/Cargo.toml require gtk4 >= 4.12 and libadwaita-1 >= 1.5, and 22.04
+    # ships 4.6 and 1.1. glibc 2.39 is the resulting floor, which matches what
+    # gtk/install.sh:9-11 already documents for the shipped binary.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install GTK4 and libadwaita
@@ -137,7 +141,9 @@ jobs:
   # still happens.
   flatpak:
     needs: version-check
-    runs-on: ubuntu-22.04
+    # Only the container host -- the build itself happens inside the gnome-48
+    # SDK below, so this runner's own toolkit versions are irrelevant.
+    runs-on: ubuntu-24.04
     continue-on-error: true
     container:
       image: bilelmoussaoui/flatpak-github-actions:gnome-48
@@ -178,7 +184,16 @@ jobs:
             -o -name '*.deb' -o -name '*.flatpak' \) -exec mv {} dist/ \;
           ls -la dist/
 
-      # VERSION comes from the tag check, so this job needs no Rust toolchain.
+      # After Collect, not before: that step sweeps every *.tar.gz out of
+      # staging/ into dist/, and this writes one there. The checkout is at the
+      # tag, so git archive packs exactly what was tagged.
+      - name: Pack the source tarball
+        env:
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: ./packaging/source-tarball.sh dist
+
+      # VERSION comes from the tag check, so this job needs no Rust toolchain
+      # (both scripts take it from the environment rather than asking cargo).
       - name: Render package metadata
         env:
           VERSION: ${{ needs.version-check.outputs.version }}
@@ -198,6 +213,9 @@ jobs:
             echo "# macOS (signed + notarized)"
             echo "brew tap haivk/betterac && brew install --cask betterac"
             echo
+            echo "# Linux, any distro  (--cask is macOS-only; this builds from source)"
+            echo "brew tap haivk/betterac && brew install betterac"
+            echo
             echo "# Arch"
             echo "yay -S betterac-bin"
             echo
@@ -210,7 +228,8 @@ jobs:
             cat dist/SHA256SUMS
             echo '```'
             echo
-            echo "The rendered \`betterac.rb\` (Homebrew cask), \`PKGBUILD\` and"
+            echo "The rendered \`betterac.rb\` (Homebrew cask, macOS),"
+            echo "\`betterac-formula.rb\` (Homebrew formula, Linux), \`PKGBUILD\` and"
             echo "\`.SRCINFO\` are attached: copy them into the tap and AUR repos."
           } > notes.md
 
@@ -218,4 +237,5 @@ jobs:
             --title "betterAC $VERSION" \
             --notes-file notes.md \
             dist/*.dmg dist/*.tar.gz dist/*.deb \
-            dist/betterac.rb dist/PKGBUILD dist/.SRCINFO dist/SHA256SUMS
+            dist/betterac.rb dist/betterac-formula.rb \
+            dist/PKGBUILD dist/.SRCINFO dist/SHA256SUMS

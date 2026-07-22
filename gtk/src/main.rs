@@ -20,9 +20,19 @@ use adw::prelude::*;
 const APP_ID: &str = "ac.betterac.BetterAC";
 
 fn main() -> gtk::glib::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Before GTK, so it answers without a display. The Homebrew formula's test
+    // block runs this: it is the only flag that is safe to run unattended --
+    // --setup would start downloading gigabytes.
+    if args.iter().any(|a| a == "--version") {
+        println!("betterac {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // Headless setup for scripts/CI. Handled before GTK so it never opens a
     // display -- it just runs the same steps the setup screen does and logs them.
-    if std::env::args().skip(1).any(|a| a == "--setup") {
+    if args.iter().any(|a| a == "--setup") {
         std::process::exit(run_setup_headless());
     }
 

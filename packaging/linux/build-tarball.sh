@@ -10,7 +10,12 @@
 #
 # Build it on the OLDEST distro you are willing to support: the binary links
 # against the host's glibc, gtk4 and libadwaita, so the build machine's glibc is
-# the floor for every user. CI uses ubuntu-22.04 (glibc 2.35) for this reason.
+# the floor for every user.
+#
+# That floor is currently ubuntu-24.04 (glibc 2.39), and it is not a free
+# choice: gtk/Cargo.toml asks for the v4_12 and v1_5 feature gates, which
+# system-deps turns into pkg-config constraints of gtk4 >= 4.12 and
+# libadwaita-1 >= 1.5. 22.04 ships 4.6 and 1.1 and cannot build this at all.
 #
 #   ./packaging/linux/build-tarball.sh
 #
@@ -48,8 +53,13 @@ mkdir -p "$PKG/data"
 install -m755 "$ROOT/target/release/betterac" "$PKG/betterac"
 install -m644 "$ROOT/gtk/data/betterac.desktop" "$PKG/data/betterac.desktop"
 install -m644 "$ROOT/gtk/data/betterac.svg" "$PKG/data/betterac.svg"
-install -m644 "$ROOT/packaging/shared/ac.betterac.BetterAC.metainfo.xml" \
+# Rendered, not copied: the shared file is a template and would otherwise ship
+# a literal @@VERSION@@ to /usr/share/metainfo. Also written to dist/ because
+# `cargo deb` installs it from there -- see [package.metadata.deb] assets.
+VERSION="$VERSION" "$ROOT/packaging/render-metainfo.sh" \
   "$PKG/data/ac.betterac.BetterAC.metainfo.xml"
+VERSION="$VERSION" "$ROOT/packaging/render-metainfo.sh" \
+  "$ROOT/dist/ac.betterac.BetterAC.metainfo.xml"
 install -m755 "$ROOT/gtk/install.sh" "$PKG/install.sh"
 install -m644 "$ROOT/README.md" "$PKG/README.md"
 install -m644 "$ROOT/LICENSE" "$PKG/LICENSE"

@@ -10,7 +10,8 @@
 #   ./packaging/render-metadata.sh dist/           # after building artifacts
 #
 # Writes into <dir>:
-#   betterac.rb        Homebrew cask   -> your homebrew-betterac tap, Casks/
+#   betterac.rb          Homebrew cask (macOS)  -> homebrew-betterac tap, Casks/
+#   betterac-formula.rb  Homebrew formula (Linux) -> same tap, Formula/betterac.rb
 #   PKGBUILD           AUR (-bin)      -> aur.archlinux.org/betterac-bin.git
 #   .SRCINFO           AUR metadata    -> same repo, generated not hand-edited
 #   ac.betterac.BetterAC.metainfo.xml  AppStream, version + date filled in
@@ -42,6 +43,9 @@ fi
 
 DMG="$DIST/BetterAC-${VERSION}-universal.dmg"
 TARBALL="$DIST/betterac-${VERSION}-x86_64.tar.gz"
+# The Linux formula builds from source, so it checksums this rather than the
+# binary tarball. Produced by packaging/source-tarball.sh.
+SRC="$DIST/betterac-${VERSION}-src.tar.gz"
 
 # sha256 of a file, portable between the macOS and Linux runners.
 sha256() {
@@ -56,17 +60,22 @@ say "Rendering metadata for $VERSION ($DATE)"
 
 DMG_SHA="$(sha256 "$DMG")"
 TARBALL_SHA="$(sha256 "$TARBALL")"
+SRC_SHA="$(sha256 "$SRC")"
 
 fill() {
   sed -e "s|@@VERSION@@|$VERSION|g" \
       -e "s|@@DATE@@|$DATE|g" \
       -e "s|@@DMG_SHA256@@|$DMG_SHA|g" \
       -e "s|@@TARBALL_SHA256@@|$TARBALL_SHA|g" \
+      -e "s|@@SRC_SHA256@@|$SRC_SHA|g" \
       "$1" > "$2"
   printf "    %s\n" "$2"
 }
 
 fill "$ROOT/packaging/homebrew/betterac.rb.in" "$DIST/betterac.rb"
+# Not betterac.rb: the cask already owns that name here. They only stop
+# colliding once they are in the tap, under Casks/ and Formula/.
+fill "$ROOT/packaging/homebrew/betterac-formula.rb.in" "$DIST/betterac-formula.rb"
 fill "$ROOT/packaging/aur/PKGBUILD.in"         "$DIST/PKGBUILD"
 fill "$ROOT/packaging/shared/ac.betterac.BetterAC.metainfo.xml" \
      "$DIST/ac.betterac.BetterAC.metainfo.xml"

@@ -1,0 +1,85 @@
+# Homebrew *formula* for betterAC on Linux. Rendered by
+# packaging/render-metadata.sh, which fills in the version and the source
+# tarball's SHA-256 from the release being built.
+#
+# Goes in the same personal tap as the cask, in the other directory:
+#
+#   cp betterac-formula.rb <tap>/Formula/betterac.rb   # this file, rendered
+#   brew tap haivk/betterac
+#   brew install betterac
+#
+# The cask (Casks/betterac.rb) ships the Mac app; this builds the GTK frontend.
+# Homebrew resolves a formula before a same-named cask, so on macOS a bare
+# `brew install betterac` lands here and stops at `depends_on :linux` with
+# "Error: betterac: Linux is required." That is why every macOS instruction in
+# this project spells out `--cask`.
+#
+# Built from source rather than repackaging the release binary, because the two
+# link different toolkits: the release binary resolves gtk4 from the distro
+# (needing >= 4.12, which a formula cannot declare or enforce), while this links
+# Homebrew's own. Homebrew bottles gtk4 and libadwaita for x86_64_linux and
+# arm64_linux, so only betterAC itself actually compiles here.
+class Betterac < Formula
+  desc "Launcher for Asheron's Call player servers"
+  homepage "https://github.com/haivk/betterAC"
+  url "https://github.com/haivk/betterAC/releases/download/v@@VERSION@@/betterac-@@VERSION@@-src.tar.gz"
+  version "@@VERSION@@"
+  sha256 "@@SRC_SHA256@@"
+  license "MIT"
+
+  depends_on :linux
+
+  depends_on "pkg-config" => :build
+  depends_on "rust" => :build
+  # The v4_12/v1_5 feature gates in gtk/Cargo.toml become pkg-config constraints
+  # of gtk4 >= 4.12 and libadwaita-1 >= 1.5. Homebrew is well past both.
+  depends_on "gtk4"
+  depends_on "libadwaita"
+
+  def install
+    # Into libexec, so the wrapper below can own bin/betterac.
+    system "cargo", "install", *std_cargo_args(root: libexec, path: "gtk")
+
+    # Homebrew's prefix is not on the default XDG_DATA_DIRS, so a bare binary
+    # cannot find gtk4's GSettings schemas or the icon theme and aborts at
+    # startup. The fallback is the XDG spec default -- without it, an unset
+    # XDG_DATA_DIRS would leave a trailing colon and an empty search entry.
+    (bin/"betterac").write_env_script libexec/"bin/betterac",
+      XDG_DATA_DIRS: "#{HOMEBREW_PREFIX}/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+    # Same three destinations the AUR package and the .deb use.
+    (share/"applications").install "gtk/data/betterac.desktop" => "ac.betterac.BetterAC.desktop"
+    (share/"icons/hicolor/scalable/apps").install "gtk/data/betterac.svg" => "ac.betterac.BetterAC.svg"
+
+    # packaging/shared/ is a TEMPLATE (@@VERSION@@/@@DATE@@ in <release>), so it
+    # is rendered rather than copied -- the same script build-tarball.sh and the
+    # Flatpak manifest use, so all four packages describe themselves identically.
+    ENV["VERSION"] = version.to_s
+    system "./packaging/render-metainfo.sh",
+           share/"metainfo/ac.betterac.BetterAC.metainfo.xml"
+  end
+
+  def caveats
+    <<~EOS
+      betterAC drives umu-launcher to run the game, and core/src/proton.rs refuses
+      to finish setup without it. Homebrew does not package it -- install it from
+      your distro or from:
+        https://github.com/Open-Wine-Components/umu-launcher
+
+      gamescope and winetricks are used when present: gamescope for correct
+      fullscreen scaling (strongly recommended), winetricks for the runtime
+      components the client needs.
+
+      The desktop entry is installed under the Homebrew prefix, so it only reaches
+      your application menu if XDG_DATA_DIRS includes it:
+        export XDG_DATA_DIRS="#{HOMEBREW_PREFIX}/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+      Launching `betterac` from a shell works either way.
+    EOS
+  end
+
+  test do
+    # The only flag safe to run unattended: --setup would start downloading the
+    # Wine runtime and the retail client, and everything else opens a window.
+    assert_match version.to_s, shell_output("#{bin}/betterac --version")
+  end
+end

@@ -15,7 +15,12 @@ env:
 
 jobs:
   linux:
-    runs-on: ubuntu-22.04
+    # 24.04, and not lower: gtk/Cargo.toml asks for the v4_12 and v1_5 feature
+    # gates, which system-deps turns into hard pkg-config constraints (gtk4
+    # >= 4.12, libadwaita-1 >= 1.5). 22.04 ships 4.6 and 1.1, so the build dies
+    # before compiling anything. The gates are load-bearing -- the launcher uses
+    # adw::NavigationSplitView and adw::Breakpoint, both libadwaita 1.4+.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

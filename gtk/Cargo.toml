@@ -45,7 +45,11 @@ assets = [
     ["../target/release/betterac", "usr/bin/", "755"],
     ["data/betterac.desktop", "usr/share/applications/ac.betterac.BetterAC.desktop", "644"],
     ["data/betterac.svg", "usr/share/icons/hicolor/scalable/apps/ac.betterac.BetterAC.svg", "644"],
-    ["../packaging/shared/ac.betterac.BetterAC.metainfo.xml", "usr/share/metainfo/", "644"],
+    # The rendered file, not packaging/shared/ (a template with @@VERSION@@ in
+    # it). Written by packaging/render-metainfo.sh, which build-tarball.sh runs
+    # -- the same script this already depends on for ../target/release/betterac,
+    # since the release workflow builds the deb with `cargo deb --no-build`.
+    ["../dist/ac.betterac.BetterAC.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../README.md", "usr/share/doc/betterac/README.md", "644"],
     ["../LICENSE", "usr/share/doc/betterac/LICENSE", "644"],
 ]

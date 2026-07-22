@@ -17,6 +17,25 @@ under Wine except the game itself. The whole class of problem goes away.
 
 ## Install
 
+From a release, via Homebrew — one tap serves both platforms:
+
+```sh
+brew tap haivk/betterac
+
+brew install --cask betterac   # macOS: the signed, notarized app
+brew install betterac          # Linux: builds from source against brew's gtk4
+```
+
+`--cask` is required on macOS. Homebrew resolves a formula before a same-named
+cask, so a bare `brew install betterac` on a Mac finds the Linux formula and stops
+with `Error: betterac: Linux is required.`
+
+Linux also has a `.deb`, an AUR package (`yay -S betterac-bin`) and a plain tarball
+on the [releases page](https://github.com/haivk/betterAC/releases). All of them need
+`umu-launcher`, which is not in Homebrew or Debian — see `packaging/README.md`.
+
+### From this repo
+
 `../install-ac.sh` runs this for you as its last step. On its own:
 
 ```sh
