@@ -68,13 +68,41 @@ pub struct Patch {
 /// rect" path. It is shared with the inventory paperdoll, and bypassing it makes
 /// the character preview render full-screen instead of inside its panel. The
 /// portal/loading screen still shows the bar for this reason.
-pub const PATCHES: &[Patch] = &[Patch {
-    name: "widescreen-viewport",
-    why: "lets the 3D view fill displays wider than 3000 px",
-    offset: 0x0D_6F3B,
-    expect: &[0x8b, 0xce, 0xe8, 0x1e, 0x8f, 0x1c, 0x00],
-    patched: &[0x8b, 0xcf, 0xe8, 0xde, 0x8d, 0x07, 0x00],
-}];
+///
+/// ## viewport-height (VA 0x4d6f33)
+///
+/// The sibling call, seven bytes earlier in the same argument push sequence. It
+/// took the viewport *height* from the same UI element, via `GetH` (0x69fe70):
+///
+/// ```text
+///   8b ce  e8 36 8f 1c 00     mov ecx,esi ; call 0x69fe70  (element GetH)
+///   8b cf  e8 f6 8d 07 00     mov ecx,edi ; call 0x54fd30  (Device::GetHeight)
+/// ```
+///
+/// The element happens to be full-height today, so this changes nothing visible
+/// on its own. It is here because leaving it half-driven by the element is a trap:
+/// anything that later scales element rects would silently drag the 3D viewport
+/// along with it. With both patches the viewport is entirely device-driven.
+///
+/// The two sites are adjacent but disjoint — 0x4d6f33..0x4d6f3a and
+/// 0x4d6f3b..0x4d6f42 — and `edi` is loaded with the device at 0x4d6f23, before
+/// either, so it is live for both.
+pub const PATCHES: &[Patch] = &[
+    Patch {
+        name: "widescreen-viewport",
+        why: "lets the 3D view fill displays wider than 3000 px",
+        offset: 0x0D_6F3B,
+        expect: &[0x8b, 0xce, 0xe8, 0x1e, 0x8f, 0x1c, 0x00],
+        patched: &[0x8b, 0xcf, 0xe8, 0xde, 0x8d, 0x07, 0x00],
+    },
+    Patch {
+        name: "viewport-height",
+        why: "takes the 3D view height from the display rather than a UI element",
+        offset: 0x0D_6F33,
+        expect: &[0x8b, 0xce, 0xe8, 0x36, 0x8f, 0x1c, 0x00],
+        patched: &[0x8b, 0xcf, 0xe8, 0xf6, 0x8d, 0x07, 0x00],
+    },
+];
 
 /// What happened to one patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +213,20 @@ mod tests {
         for p in PATCHES {
             assert_eq!(p.expect.len(), p.patched.len(), "{}: length must match", p.name);
             assert_ne!(p.expect, p.patched, "{}: patch is a no-op", p.name);
+        }
+    }
+
+    #[test]
+    fn real_patches_do_not_overlap() {
+        // widescreen-viewport and viewport-height are seven bytes apart in the
+        // same push sequence. Overlapping ranges would make the pair order
+        // dependent, and the second would see bytes the first had already moved.
+        let mut spans: Vec<_> = PATCHES.iter().map(|p| (p.offset, p.offset + p.expect.len(), p.name)).collect();
+        spans.sort();
+        for w in spans.windows(2) {
+            let (_, a_end, a) = w[0];
+            let (b_start, _, b) = w[1];
+            assert!(a_end <= b_start, "{a} overlaps {b}");
         }
     }
 
