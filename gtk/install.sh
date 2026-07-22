@@ -2,24 +2,36 @@
 #
 # Install betterAC into ~/.local -- no root, no sandbox.
 #
+# This is the installer that ships INSIDE the release tarball, and the one to run
+# from a git checkout. To get it onto a machine that has neither, the bootstrap
+# at the repo root downloads a release and then runs this:
+#
+#   curl -fsSL https://raw.githubusercontent.com/haivk/betterAC/main/install.sh | bash
+#
 # By default this installs the prebuilt binary in dist/. Bazzite is an atomic
 # distro with no compiler on the host, and betterAC has to *run* on the host (it
 # shells out to umu-run), so building it here would mean a toolbox, a Rust
 # toolchain and the GTK4 dev headers just to produce a 2 MB file that never
-# changes. The binary is built on Fedora 41 -- older than any Bazzite -- so its
-# glibc floor (2.39) sits below the host's and it links only against libgtk-4,
-# libadwaita and glib, which every GNOME desktop already has.
+# changes. The release binary is built on ubuntu-24.04, so its floor is glibc
+# 2.39 plus gtk4 >= 4.12 and libadwaita >= 1.5 -- which is what the crate's
+# v4_12/v1_5 feature gates require, and what any current GNOME desktop has.
 #
-# Pass --build to compile from source instead. That needs a toolbox:
+# Pass --build to compile from source instead. On an atomic distro that needs a
+# toolbox; elsewhere just install the toolkit's development files:
 #
-#   toolbox create ac && toolbox enter ac
+#   toolbox create ac && toolbox enter ac        # Bazzite/Silverblue
 #   sudo dnf install -y cargo gtk4-devel libadwaita-devel
 #   ./install.sh --build
 #
-# Deliberately not a Flatpak: the launcher's entire job is to run umu-run on the
-# host, and a Flatpak can only do that by punching --talk-name=org.freedesktop.Flatpak
-# through the sandbox, at which point the sandbox is decoration. A plain ~/.local
-# install is honest about what this is.
+#   sudo apt install cargo libgtk-4-dev libadwaita-1-dev   # Debian/Ubuntu
+#
+# Deliberately not a Flatpak, and not for lack of trying. The launcher's job is
+# to drive umu-run on the host, which a sandbox cannot see. Bundling Wine instead
+# does not rescue it either: measured 2026-07-22, inside a Flatpak `wine cmd`
+# runs fine but acclient.exe is killed with SIGSYS by the sandbox seccomp filter
+# (it dies in wine-preloader doing 32-bit address-space setup), and neither
+# --allow=devel nor --device=all lifts it. A plain ~/.local install is honest
+# about what this program is.
 #
 set -euo pipefail
 

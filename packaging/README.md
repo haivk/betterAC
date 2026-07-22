@@ -8,6 +8,7 @@ inside GitHub Actions.
 |---|---|
 | `macos/build-dmg.sh` | universal `.app` → sign → `.dmg` → notarize → staple |
 | `linux/build-tarball.sh` | binary + desktop + icon + metainfo → `.tar.gz` |
+| `../install.sh` | the curl-able bootstrap: finds the latest release, verifies it, runs the tarball's `install.sh` |
 | `source-tarball.sh` | `git archive` of the tagged tree → `-src.tar.gz`, what the Linux formula builds |
 | `render-metadata.sh` | fills the templates below with the version and real SHA-256s |
 | `homebrew/betterac.rb.in` | Homebrew **cask** template — macOS, ships the `.dmg` |
@@ -18,6 +19,12 @@ inside GitHub Actions.
 
 The `.deb` has no script: it is `cargo deb`, configured under
 `[package.metadata.deb]` in `gtk/Cargo.toml`.
+
+The root `install.sh` is not built or attached to a release — it is served from
+`raw.githubusercontent.com/haivk/betterAC/main/install.sh`, so it is always the
+`main` copy. It depends on two things being present on every release: the
+tarball named `betterac-<version>-x86_64.tar.gz`, and `SHA256SUMS`. Renaming
+either breaks every published one-liner, so don't.
 
 ## Cutting a release
 

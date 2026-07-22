@@ -210,10 +210,13 @@ jobs:
             echo
             echo "### Install"
             echo '```sh'
+            echo "# Linux, any distro -- downloads this release, verifies it, installs to ~/.local"
+            echo "curl -fsSL https://raw.githubusercontent.com/haivk/betterAC/main/install.sh | bash"
+            echo
             echo "# macOS (signed + notarized)"
             echo "brew tap haivk/betterac && brew install --cask betterac"
             echo
-            echo "# Linux, any distro  (--cask is macOS-only; this builds from source)"
+            echo "# Linux via Homebrew, when your distro's gtk4 is older than 4.12"
             echo "brew tap haivk/betterac && brew install betterac"
             echo
             echo "# Arch"

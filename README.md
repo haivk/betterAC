@@ -17,7 +17,23 @@ under Wine except the game itself. The whole class of problem goes away.
 
 ## Install
 
-From a release, via Homebrew — one tap serves both platforms:
+**Linux — one line, any distro:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/haivk/betterAC/main/install.sh | bash
+```
+
+Downloads the latest release, checks it against the published `SHA256SUMS`, proves the
+binary actually runs on your machine, then installs to `~/.local` — binary, `.desktop`
+entry, icon. No root, no sandbox, no compiler. This is the recommended path on Bazzite
+and other atomic distros, where there is no host compiler and betterAC has to run on
+the host anyway.
+
+If your toolkit is too old (it needs glibc ≥ 2.39, gtk4 ≥ 4.12, libadwaita ≥ 1.5) the
+script says so before installing anything, rather than leaving you with a binary that
+will not start.
+
+**macOS, and Linux via Homebrew:**
 
 ```sh
 brew tap haivk/betterac
@@ -28,7 +44,9 @@ brew install betterac          # Linux: builds from source against brew's gtk4
 
 `--cask` is required on macOS. Homebrew resolves a formula before a same-named
 cask, so a bare `brew install betterac` on a Mac finds the Linux formula and stops
-with `Error: betterac: Linux is required.`
+with `Error: betterac: Linux is required.` On Linux the formula is mainly useful when
+your distro's gtk4 is older than 4.12 — it brings its own toolkit, at the cost of
+several hundred MB of bottles. Where the one-liner above works, prefer it.
 
 Linux also has a `.deb`, an AUR package (`yay -S betterac-bin`) and a plain tarball
 on the [releases page](https://github.com/haivk/betterAC/releases). All of them need
@@ -36,28 +54,31 @@ on the [releases page](https://github.com/haivk/betterAC/releases). All of them 
 
 ### From this repo
 
-`../install-ac.sh` runs this for you as its last step. On its own:
-
 ```sh
-./install.sh
+./gtk/install.sh          # install the prebuilt binary in gtk/dist/
+./gtk/install.sh --build  # compile from source and install that
 ```
 
-Installs the prebuilt binary from `dist/` to `~/.local` — binary, `.desktop` entry, icon. No
-root, no sandbox, no compiler.
+Same `~/.local` layout as the one-liner — it is the same script, and the release
+tarball ships it. `../install-ac.sh` calls it as its last step.
 
 Shipping a binary is the point. Bazzite is atomic and has no compiler on the host, but
 betterAC has to *run* on the host — it shells out to `umu-run` — so building it would mean a
 toolbox, a Rust toolchain and the GTK4 headers just to produce a 2 MB file that doesn't change.
-`dist/betterac-x86_64` is built on Fedora 41, older than any Bazzite, so its glibc floor (2.39)
-sits below the host's, and it links only against `libgtk-4`, `libadwaita` and `glib` — which a
-GNOME desktop already has. The installer checks with `ldd` and tells you if it's wrong.
+The release binary is built on ubuntu-24.04, so its floor is glibc 2.39 plus gtk4 ≥ 4.12 and
+libadwaita ≥ 1.5 — the versions the crate's `v4_12`/`v1_5` feature gates require, and which a
+current GNOME desktop already has. The installer checks with `ldd` and tells you if it's wrong.
 
-To build from source instead:
+To build from source instead — on an atomic distro that needs a toolbox, elsewhere just the
+toolkit's development files:
 
 ```sh
-toolbox create ac && toolbox enter ac
+toolbox create ac && toolbox enter ac              # Bazzite/Silverblue
 sudo dnf install -y cargo gtk4-devel libadwaita-devel
-./install.sh --build
+./gtk/install.sh --build
+
+sudo apt install cargo libgtk-4-dev libadwaita-1-dev   # Debian/Ubuntu
+./gtk/install.sh --build
 ```
 
 A toolbox shares your `$HOME`, so the binary it builds installs straight to `~/.local` and runs
