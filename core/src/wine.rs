@@ -35,6 +35,7 @@ use crate::args::{client_args, validate};
 use crate::fetch::{download, extract_tar_gz, extract_zip, verify_sha256};
 use crate::gamefiles::GameSources;
 use crate::install::{engine_dir, find_acclient, find_game_dir, Install};
+use crate::patches;
 use crate::prefs::{env_flag, env_resolution};
 use crate::servers::Server;
 use crate::setup::{is_stamped, mark_stamped, Progress, Runtime, SetupStep};
@@ -311,6 +312,34 @@ impl WineRuntime {
         Ok(())
     }
 
+    /// Byte-patch the client for defects that config cannot reach -- see
+    /// [`crate::patches`]. Runs after the update bundle, because that is what puts
+    /// the client we patch in place. A patch that does not recognise the build is
+    /// reported and skipped, never fatal: an unpatched client is still playable.
+    fn step_patch_client(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
+        if is_stamped(&self.prefix, SetupStep::PatchClient) {
+            on(Progress::skipped(SetupStep::PatchClient, "the client is already patched"));
+            return Ok(());
+        }
+        let game_dir =
+            find_game_dir(&self.prefix).ok_or("game directory not found for patching the client")?;
+        let client = find_acclient(&game_dir)
+            .ok_or("no acclient.exe in the game directory -- did the update apply?")?;
+        on(Progress::new(SetupStep::PatchClient, 0.5, "applying client patches…"));
+        for (name, outcome) in patches::apply_all(&client)? {
+            let msg = match outcome {
+                patches::Outcome::Applied => format!("applied {name}"),
+                patches::Outcome::AlreadyApplied => format!("{name}: already applied"),
+                patches::Outcome::Skipped => {
+                    format!("warning: skipped {name} -- not the client build it targets")
+                }
+            };
+            on(Progress::new(SetupStep::PatchClient, 0.9, msg));
+        }
+        mark_stamped(&self.prefix, SetupStep::PatchClient).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn step_finalize(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
         if is_stamped(&self.prefix, SetupStep::Finalize) {
             on(Progress::skipped(SetupStep::Finalize, "already set up"));
@@ -337,6 +366,7 @@ impl Runtime for WineRuntime {
             SetupStep::Components => self.step_components(on),
             SetupStep::InstallClient => self.step_install_client(on),
             SetupStep::ApplyUpdates => self.step_apply_updates(on),
+            SetupStep::PatchClient => self.step_patch_client(on),
             SetupStep::Finalize => self.step_finalize(on),
         }
     }

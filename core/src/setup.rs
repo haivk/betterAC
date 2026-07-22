@@ -97,6 +97,8 @@ pub enum SetupStep {
     InstallClient,
     /// Apply the End-of-Retail dats + patched acclient over the retail install.
     ApplyUpdates,
+    /// Byte-patch the client for defects that config cannot reach (see `patches`).
+    PatchClient,
     /// Write the direct-launch escape hatch and mark the install complete.
     Finalize,
 }
@@ -105,7 +107,7 @@ impl SetupStep {
     /// Every step, in run order. Downloads first: they are the long unattended
     /// stretch, and getting them done before the installer wizard means the user
     /// is only interrupted once, at a predictable point.
-    pub const ALL: [SetupStep; 10] = [
+    pub const ALL: [SetupStep; 11] = [
         SetupStep::Dependencies,
         SetupStep::DownloadRuntime,
         SetupStep::DownloadClient,
@@ -115,6 +117,7 @@ impl SetupStep {
         SetupStep::Components,
         SetupStep::InstallClient,
         SetupStep::ApplyUpdates,
+        SetupStep::PatchClient,
         SetupStep::Finalize,
     ];
 
@@ -130,6 +133,7 @@ impl SetupStep {
             SetupStep::Components => "Installing runtime components",
             SetupStep::InstallClient => "Installing Asheron's Call",
             SetupStep::ApplyUpdates => "Applying the End-of-Retail update",
+            SetupStep::PatchClient => "Patching the game client",
             SetupStep::Finalize => "Finishing up",
         }
     }
@@ -148,6 +152,7 @@ impl SetupStep {
             SetupStep::Components => "Extra libraries the client needs",
             SetupStep::InstallClient => "The original installer opens — you click through it",
             SetupStep::ApplyUpdates => "Copying the update files over the install",
+            SetupStep::PatchClient => "Fixes for modern displays the client never expected",
             SetupStep::Finalize => "Last checks and a direct-launch shortcut",
         }
     }
@@ -170,6 +175,7 @@ impl SetupStep {
             SetupStep::Components => Some("components"),
             SetupStep::InstallClient => Some("client"),
             SetupStep::ApplyUpdates => Some("updates"),
+            SetupStep::PatchClient => Some("patches"),
             SetupStep::Finalize => Some("finalize"),
         }
     }
@@ -452,9 +458,9 @@ mod tests {
 
     #[test]
     fn every_step_has_a_label_and_the_order_is_fixed() {
-        assert_eq!(SetupStep::ALL.len(), 10);
+        assert_eq!(SetupStep::ALL.len(), 11);
         assert_eq!(SetupStep::ALL[0], SetupStep::Dependencies);
-        assert_eq!(SetupStep::ALL[9], SetupStep::Finalize);
+        assert_eq!(*SetupStep::ALL.last().unwrap(), SetupStep::Finalize);
         for s in SetupStep::ALL {
             assert!(!s.label().is_empty());
             assert!(!s.detail().is_empty());
@@ -471,6 +477,15 @@ mod tests {
         assert!(pos(SetupStep::DownloadClient) < pos(SetupStep::InstallRuntime));
         assert!(pos(SetupStep::DownloadUpdates) < pos(SetupStep::InstallRuntime));
         assert!(pos(SetupStep::InstallClient) < pos(SetupStep::ApplyUpdates));
+    }
+
+    #[test]
+    fn the_client_is_patched_after_the_update_that_delivers_it() {
+        // ApplyUpdates overwrites acclient.exe with the End-of-Retail build, so
+        // patching before it would be silently undone.
+        let pos = |want: SetupStep| SetupStep::ALL.iter().position(|&s| s == want).unwrap();
+        assert!(pos(SetupStep::ApplyUpdates) < pos(SetupStep::PatchClient));
+        assert!(pos(SetupStep::PatchClient) < pos(SetupStep::Finalize));
     }
 
     #[test]

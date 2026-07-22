@@ -15,6 +15,7 @@ pub mod config;
 pub mod fetch;
 pub mod gamefiles;
 pub mod install;
+pub mod patches;
 pub mod prefs;
 pub mod proton;
 pub mod servers;
