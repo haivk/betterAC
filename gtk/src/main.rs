@@ -12,7 +12,6 @@
 //! to run. `--setup` does the same thing headless (no window), which is all the
 //! old install-ac.sh now needs to call.
 
-mod browser;
 mod launcher;
 mod window;
 

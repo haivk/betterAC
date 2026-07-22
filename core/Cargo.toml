@@ -1,9 +1,10 @@
 [package]
 name = "ac-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Platform-agnostic core for the Asheron's Call launcher: servers, config, client argument shapes, install discovery, and setup."
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 # No GUI toolkit here, on purpose. This crate must build on both the Linux host
 # (where the GTK frontend links it) and macOS (where the SwiftUI app links it

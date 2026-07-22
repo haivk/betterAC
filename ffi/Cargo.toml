@@ -1,9 +1,10 @@
 [package]
 name = "ac-ffi"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "C ABI over ac-core for the macOS SwiftUI app."
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 build = "build.rs"
 
 [dependencies]

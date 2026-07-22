@@ -33,10 +33,14 @@ settings:
     OTHER_LDFLAGS:
       - -lac_ffi
       # ac-core's macOS launch path queries the display via CoreGraphics to size
-      # AC's window; Xcode links the .a directly so it won't honour the Rust
-      # #[link] directive — name the framework explicitly.
+      # AC's window and to decide whether exclusive fullscreen is even possible;
+      # walking the mode list needs CoreFoundation's CFArray too. Xcode links the
+      # .a directly so it won't honour the Rust #[link] directives — name the
+      # frameworks explicitly.
       - -framework
       - CoreGraphics
+      - -framework
+      - CoreFoundation
   configs:
     # Day-to-day ⌘R builds only this Mac's arch, so a dev never needs a
     # cross-compiling toolchain installed. Release builds both slices.

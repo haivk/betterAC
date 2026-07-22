@@ -35,6 +35,7 @@ use crate::args::{client_args, validate};
 use crate::fetch::{download, extract_tar_gz, extract_zip, verify_sha256};
 use crate::gamefiles::GameSources;
 use crate::install::{engine_dir, find_acclient, find_game_dir, Install};
+use crate::prefs::{env_flag, env_resolution};
 use crate::servers::Server;
 use crate::setup::{is_stamped, mark_stamped, Progress, Runtime, SetupStep};
 use std::path::{Path, PathBuf};
@@ -382,13 +383,16 @@ impl Runtime for WineRuntime {
 /// Resolution is taken from `BETTERAC_RESOLUTION` (WxH), else the `res` argument,
 /// else the main display (CoreGraphics).
 ///
-/// Fullscreen is the default: the Mac driver drops a fullscreen-requesting game
-/// into a real macOS fullscreen space, and because we pin AC's resolution to the
-/// display it fills correctly rather than stretching. Escape hatches:
-/// `BETTERAC_DESKTOP=1` runs inside a Wine virtual desktop instead (always a
-/// window on the Mac driver, but it cannot stretch — a fallback for displays that
-/// mis-scale fullscreen); `BETTERAC_WINDOWED=1` runs AC in a plain window; and
-/// `BETTERAC_RESOLUTION=WxH` forces a size.
+/// The screen mode is chosen per display, not fixed — see [`LaunchMode`] for the
+/// measurements behind it. Where the Mac driver can give AC a real fullscreen
+/// device it gets one; where it cannot (a MacBook's built-in panel offers no 4:3
+/// mode, and AC refuses to create a device without one) AC runs fullscreen inside
+/// a Wine virtual desktop, which synthesises the modes it wants.
+///
+/// Escape hatches: `BETTERAC_WINDOWED=1` forces a plain window (AC then pins
+/// itself to 800x600); `BETTERAC_DESKTOP=1` forces the virtual desktop;
+/// `BETTERAC_FULLSCREEN=1` demands real fullscreen even where we expect it to
+/// fail; `BETTERAC_RESOLUTION=WxH` forces a size.
 pub fn launch(
     install: &Install,
     server: &Server,
@@ -403,27 +407,35 @@ pub fn launch(
     contain_user_profile(&install.prefix);
 
     let resolution = env_resolution().or(res).or_else(display::main_resolution);
-    let use_desktop = env_flag("BETTERAC_DESKTOP");
-    let fullscreen = !use_desktop && !env_flag("BETTERAC_WINDOWED");
+    let mode = LaunchMode::choose(
+        env_flag("BETTERAC_WINDOWED"),
+        env_flag("BETTERAC_DESKTOP"),
+        env_flag("BETTERAC_FULLSCREEN"),
+        display::exclusive_fullscreen_available,
+    );
 
     if let Some((w, h)) = resolution {
-        // Inside a virtual desktop AC must be windowed (it fills the desktop
-        // window); otherwise it takes the mode the ini requests. We enforce these
-        // two keys every launch (preserving AC's other settings) so the window
-        // mode always reflects betterAC's choice.
-        let ac_fullscreen = if use_desktop { false } else { fullscreen };
-        for path in prefs_paths(install) {
-            write_display_prefs(&path, (w, h), ac_fullscreen);
-        }
+        // AC is told "fullscreen" for both real fullscreen *and* inside a virtual
+        // desktop — in the latter it goes fullscreen within the desktop, which is
+        // the whole point (it is what makes the device creation succeed there).
+        // Enforced every launch, because AC rewrites this file on exit and would
+        // otherwise carry its last session's mode into the next one.
+        crate::prefs::apply(&install.ac_dir, &install.prefix, (w, h), mode.ac_fullscreen());
     }
 
     let mut argv: Vec<String> = Vec::new();
-    if let (true, Some((w, h))) = (use_desktop, resolution) {
-        // wine explorer /desktop=NAME,WxH  acclient.exe <args>
+    let mut client = "acclient.exe".to_string();
+    if let (LaunchMode::Desktop, Some((w, h))) = (mode, resolution) {
+        // wine explorer /desktop=NAME,WxH  C:\...\acclient.exe <args>
+        //
+        // explorer.exe does NOT resolve a bare "acclient.exe" against our working
+        // directory the way `wine acclient.exe` does — it silently starts nothing
+        // at all, so this path has to name the client outright.
         argv.push("explorer".into());
         argv.push(format!("/desktop=betterac,{w}x{h}"));
+        client = windows_path(&install.prefix, &install.ac_dir.join("acclient.exe"));
     }
-    argv.push("acclient.exe".into());
+    argv.push(client);
     argv.extend(client_args(server, account, password));
 
     // `install.proton` holds the wine binary on macOS (see `discover`).
@@ -445,94 +457,90 @@ pub fn launch(
     })
 }
 
-/// `BETTERAC_RESOLUTION=WxH`, parsed. `None` if unset or malformed.
-fn env_resolution() -> Option<(i32, i32)> {
-    let raw = std::env::var("BETTERAC_RESOLUTION").ok()?;
-    let (w, h) = raw.trim().split_once(['x', 'X'])?;
-    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+/// How AC gets its screen.
+///
+/// ## The bug this exists for
+///
+/// AC dies on startup with *"The game encountered a fatal DirectX issue while
+/// attempting to start. Try a different screen resolution or bit depth."* when it
+/// asks for a fullscreen D3D9 device the Mac driver cannot satisfy. On a MacBook's
+/// built-in Retina panel that is **every** resolution: measured on a 14" M4 Pro
+/// (2026-07-21), 1024x768, 1512x945, 1512x982, 1920x1200, 2560x1600 and the native
+/// 3024x1964 all produce the dialog, at both HiDPI and true 1:1 desktop modes, at
+/// 60 and 120 Hz. The same client on an external ultrawide goes fullscreen fine.
+///
+/// ## Why
+///
+/// A `+d3d` trace shows AC enumerating all 132 modes the driver offers and then
+/// giving up without ever calling `CreateDevice`. The offered list is the tell —
+/// winemac.drv passes through what macOS reports for the attached display:
+///
+///   - built-in panel: `960x600 … 3024x1964`, every one of them 16:10 or the
+///     notch-inclusive variant. **No 4:3 mode exists.**
+///   - the ultrawide: includes `640x480`, `800x600`, `1024x768`, `1280x960`,
+///     `1344x1008`, `1600x1200` — the classic 4:3 modes a 1999 client expects.
+///
+/// A Wine **virtual desktop** does not pass the host's list through; it synthesises
+/// its own, which contains exactly those 4:3 modes. So AC finds what it needs,
+/// `wined3d_device_create` succeeds, and it renders fullscreen inside the desktop
+/// — verified end to end on the built-in panel, all the way into the world.
+///
+/// Ruled out along the way: the requested resolution, bit depth (every mode on
+/// both displays is 32-bit), Wine's `RetinaMode`, `CaptureDisplaysForFullscreen`,
+/// `AspectRatio=Widescreen`, the desktop being HiDPI (the ultrawide's is too), the
+/// refresh rate, and an active macOS fullscreen Space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    /// Real exclusive fullscreen. Only where the display can actually do it.
+    Fullscreen,
+    /// Fullscreen inside a Wine virtual desktop — the fallback that makes the
+    /// built-in panel work, and no worse than a window anywhere else.
+    Desktop,
+    /// A plain window. Only on request: AC ignores `Resolution` when windowed and
+    /// pins itself to 800x600.
+    Windowed,
 }
 
-/// True when an env var is set to something other than empty/"0".
-fn env_flag(key: &str) -> bool {
-    std::env::var(key).ok().is_some_and(|v| !v.is_empty() && v != "0")
-}
-
-/// The files AC might read its preferences from: the game directory and
-/// `<My Documents>\Asheron's Call` (clients differ on which they use).
-fn prefs_paths(install: &Install) -> Vec<PathBuf> {
-    let mut paths = vec![install.ac_dir.join("UserPreferences.ini")];
-    if let Some(docs) = ac_documents_dir(&install.prefix) {
-        paths.push(docs.join("UserPreferences.ini"));
-    }
-    paths
-}
-
-/// Enforce AC's `[Display]` Resolution + FullScreen at `path`, preserving every
-/// other line so the user's other in-game settings survive. Creates the file (and
-/// parent dirs) if absent.
-fn write_display_prefs(path: &Path, res: (i32, i32), fullscreen: bool) {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let merged = merge_display_ini(&existing, res, fullscreen);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, merged);
-}
-
-/// Return `existing` with `Resolution` and `FullScreen` in its `[Display]` section
-/// set to the given values, every other line untouched. Adds the keys to an
-/// existing `[Display]`, or appends a fresh `[Display]` section if there is none.
-/// Emits CRLF, as the Windows client expects.
-fn merge_display_ini(existing: &str, (w, h): (i32, i32), fullscreen: bool) -> String {
-    let res_line = format!("Resolution={w}x{h}");
-    let fs_line = format!("FullScreen={}", if fullscreen { "True" } else { "False" });
-    let key_of = |line: &str| line.trim().split('=').next().unwrap_or("").trim().to_ascii_lowercase();
-
-    let mut out: Vec<String> = Vec::new();
-    let (mut in_display, mut seen_display, mut set_res, mut set_fs) = (false, false, false, false);
-
-    for raw in existing.lines() {
-        let line = raw.trim_end_matches('\r');
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_display {
-                // Leaving [Display]: append any managed key we didn't overwrite.
-                if !set_res { out.push(res_line.clone()); }
-                if !set_fs { out.push(fs_line.clone()); }
-            }
-            in_display = trimmed.eq_ignore_ascii_case("[Display]");
-            seen_display |= in_display;
-            out.push(line.to_string());
-            continue;
+impl LaunchMode {
+    /// Explicit user intent first, then what the display can do. Falling back to
+    /// [`LaunchMode::Desktop`] rather than [`LaunchMode::Windowed`] matters: the
+    /// window AC gives us is a fixed 800x600, the virtual desktop fills the screen.
+    fn choose(
+        force_windowed: bool,
+        force_desktop: bool,
+        force_fullscreen: bool,
+        available: impl Fn() -> bool,
+    ) -> Self {
+        match (force_windowed, force_desktop, force_fullscreen) {
+            (true, _, _) => Self::Windowed,
+            (_, true, _) => Self::Desktop,
+            (_, _, true) => Self::Fullscreen,
+            _ if available() => Self::Fullscreen,
+            _ => Self::Desktop,
         }
-        if in_display {
-            match key_of(line).as_str() {
-                "resolution" => { out.push(res_line.clone()); set_res = true; continue; }
-                "fullscreen" => { out.push(fs_line.clone()); set_fs = true; continue; }
-                _ => {}
-            }
-        }
-        out.push(line.to_string());
     }
-    if in_display {
-        if !set_res { out.push(res_line.clone()); }
-        if !set_fs { out.push(fs_line.clone()); }
+
+    /// What to write to AC's `FullScreen` key. True inside a virtual desktop too —
+    /// that is what makes its device creation succeed.
+    fn ac_fullscreen(self) -> bool {
+        matches!(self, Self::Fullscreen | Self::Desktop)
     }
-    if !seen_display {
-        if out.last().is_some_and(|l| !l.is_empty()) {
-            out.push(String::new());
-        }
-        out.extend([
-            "[Display]".into(),
-            "RefreshRate=Auto".into(),
-            res_line,
-            fs_line,
-            "SyncToRefresh=False".into(),
-        ]);
+}
+
+/// A path inside the prefix as Wine sees it: `C:\Turbine\Asheron's Call\…` for
+/// anything under `drive_c`, else the `Z:` drive that maps the real filesystem.
+/// Needed because `explorer /desktop=` starts nothing when handed a bare
+/// executable name.
+fn windows_path(prefix: &Path, path: &Path) -> String {
+    let win = |rest: &Path, drive: &str| {
+        let joined: Vec<String> =
+            rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        format!("{drive}\\{}", joined.join("\\"))
+    };
+    match path.strip_prefix(prefix.join("drive_c")) {
+        Ok(rest) => win(rest, "C:"),
+        Err(_) => win(path.strip_prefix("/").unwrap_or(path), "Z:"),
     }
-    let mut joined = out.join("\r\n");
-    joined.push_str("\r\n");
-    joined
 }
 
 /// Keep the Wine user profile inside the prefix. Wine points the profile folders
@@ -578,34 +586,32 @@ fn contain_user_profile(prefix: &Path) {
     }
 }
 
-/// `<prefix>/drive_c/users/<user>/Documents/Asheron's Call`, the retail client's
-/// preferences home. Uses `$USER`, falling back to the first non-Public user dir.
-fn ac_documents_dir(prefix: &Path) -> Option<PathBuf> {
-    let users = prefix.join("drive_c/users");
-    if let Ok(user) = std::env::var("USER") {
-        let p = users.join(&user);
-        if p.is_dir() {
-            return Some(p.join("Documents").join("Asheron's Call"));
-        }
-    }
-    for e in std::fs::read_dir(&users).ok()?.flatten() {
-        let p = e.path();
-        if p.is_dir() && p.file_name().is_some_and(|n| n != "Public") {
-            return Some(p.join("Documents").join("Asheron's Call"));
-        }
-    }
-    None
-}
-
 /// The main display's logical resolution, via CoreGraphics. `CGDisplayPixelsWide`
 /// returns points (the "looks like" resolution) rather than raw Retina pixels,
 /// which is exactly the size we want AC to render at.
 mod display {
+    use std::os::raw::c_void;
+
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGMainDisplayID() -> u32;
         fn CGDisplayPixelsWide(display: u32) -> usize;
         fn CGDisplayPixelsHigh(display: u32) -> usize;
+        fn CGDisplayIsBuiltin(display: u32) -> i32;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        fn CGDisplayModeRelease(mode: *mut c_void);
+        fn CGDisplayCopyAllDisplayModes(display: u32, options: *const c_void) -> *const c_void;
+        fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
     }
 
     pub fn main_resolution() -> Option<(i32, i32)> {
@@ -614,6 +620,56 @@ mod display {
             let id = CGMainDisplayID();
             let (w, h) = (CGDisplayPixelsWide(id), CGDisplayPixelsHigh(id));
             (w > 0 && h > 0).then_some((w as i32, h as i32))
+        }
+    }
+
+    /// Can this display give AC an exclusive-fullscreen D3D9 device?
+    ///
+    /// Two conditions, both observed rather than derived — see
+    /// [`can_go_exclusive_fullscreen`] for the measurements:
+    ///
+    ///   1. the display is **not** the machine's built-in panel, and
+    ///   2. the desktop's current logical size also exists as a 1:1 mode
+    ///      (`pixelWidth == width`).
+    ///
+    /// The answer changes when a monitor is plugged in or unplugged, so this is
+    /// asked on every launch and never cached.
+    pub fn exclusive_fullscreen_available() -> bool {
+        // SAFETY: `CGDisplayCopyDisplayMode`/`CGDisplayCopyAllDisplayModes` return
+        // owned references (null on failure), released below; the getters only read
+        // a mode we still hold.
+        unsafe {
+            let id = CGMainDisplayID();
+            if CGDisplayIsBuiltin(id) != 0 {
+                return false;
+            }
+            let current = CGDisplayCopyDisplayMode(id);
+            if current.is_null() {
+                return false;
+            }
+            let want = (CGDisplayModeGetWidth(current), CGDisplayModeGetHeight(current));
+            CGDisplayModeRelease(current);
+
+            let modes = CGDisplayCopyAllDisplayModes(id, std::ptr::null());
+            if modes.is_null() {
+                return false;
+            }
+            let mut found = false;
+            for i in 0..CFArrayGetCount(modes) {
+                let m = CFArrayGetValueAtIndex(modes, i);
+                if m.is_null() {
+                    continue;
+                }
+                let (w, h) = (CGDisplayModeGetWidth(m), CGDisplayModeGetHeight(m));
+                let one_to_one =
+                    CGDisplayModeGetPixelWidth(m) == w && CGDisplayModeGetPixelHeight(m) == h;
+                if one_to_one && (w, h) == want {
+                    found = true;
+                    break;
+                }
+            }
+            CFRelease(modes);
+            found
         }
     }
 }
@@ -764,47 +820,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_into_an_empty_file_creates_a_display_section() {
-        let out = merge_display_ini("", (3360, 1418), true);
-        assert!(out.contains("[Display]"));
-        assert!(out.contains("Resolution=3360x1418"));
-        assert!(out.contains("FullScreen=True"));
-        assert!(out.ends_with("\r\n"));
-    }
-
-    #[test]
-    fn merge_updates_existing_keys_and_preserves_the_rest() {
-        let existing = "[Display]\r\nRefreshRate=Auto\r\nResolution=1024x768\r\nFullScreen=False\r\n\
-                        [Rendering]\r\nTexFilter=2\r\n";
-        let out = merge_display_ini(existing, (2560, 1440), true);
-        assert!(out.contains("Resolution=2560x1440"));
-        assert!(out.contains("FullScreen=True"));
-        assert!(!out.contains("1024x768"), "old resolution must be gone");
-        assert!(!out.contains("FullScreen=False"), "old fullscreen must be gone");
-        // Untouched settings survive.
-        assert!(out.contains("[Rendering]"));
-        assert!(out.contains("TexFilter=2"));
-        assert!(out.contains("RefreshRate=Auto"));
-        // Each managed key appears exactly once.
-        assert_eq!(out.matches("FullScreen=").count(), 1);
-        assert_eq!(out.matches("Resolution=").count(), 1);
-    }
-
-    #[test]
-    fn merge_adds_missing_keys_to_an_existing_display_section() {
-        // A [Display] section that has neither key yet, followed by another section.
-        let existing = "[Display]\r\nRefreshRate=Auto\r\n[Sound]\r\nVolume=10\r\n";
-        let out = merge_display_ini(existing, (1920, 1080), false);
-        assert!(out.contains("Resolution=1920x1080"));
-        assert!(out.contains("FullScreen=False"));
-        assert!(out.contains("[Sound]") && out.contains("Volume=10"));
-        // The keys landed inside [Display], before [Sound].
-        let disp = out.find("Resolution=1920x1080").unwrap();
-        let sound = out.find("[Sound]").unwrap();
-        assert!(disp < sound, "managed keys must stay in the [Display] section");
-    }
-
-    #[test]
     fn launch_refuses_bad_credentials_before_spawning() {
         // validate() runs first, so a colon password on GDLE is rejected here and
         // we never try to exec a nonexistent wine binary.
@@ -815,5 +830,53 @@ mod tests {
         };
         let err = launch(&install, &srv(Software::Gdle), "hank", "hun:ter2", None).unwrap_err();
         assert!(err.contains("colon"), "unexpected error: {err}");
+    }
+
+    /// The crash this guards: asking for exclusive fullscreen on a display that
+    /// offers AC no 4:3 mode kills it with a DirectX dialog before it ever creates
+    /// a device, so such a display must get the virtual desktop instead.
+    #[test]
+    fn the_display_decides_the_mode_unless_the_user_says_otherwise() {
+        let (yes, no) = (|| true, || false);
+
+        // The two machines this was measured on.
+        assert_eq!(LaunchMode::choose(false, false, false, yes), LaunchMode::Fullscreen);
+        assert_eq!(LaunchMode::choose(false, false, false, no), LaunchMode::Desktop);
+
+        // Explicit intent wins, in priority order.
+        assert_eq!(LaunchMode::choose(true, false, false, yes), LaunchMode::Windowed);
+        assert_eq!(LaunchMode::choose(false, true, false, yes), LaunchMode::Desktop);
+        assert_eq!(LaunchMode::choose(false, false, true, no), LaunchMode::Fullscreen);
+        assert_eq!(LaunchMode::choose(true, true, true, no), LaunchMode::Windowed);
+
+        // AC must be told "fullscreen" inside a virtual desktop -- writing False
+        // there is what the pre-2026-07-21 code did, and it wastes the desktop.
+        assert!(LaunchMode::Desktop.ac_fullscreen(), "regression: the whole point of Desktop");
+        assert!(LaunchMode::Fullscreen.ac_fullscreen());
+        assert!(!LaunchMode::Windowed.ac_fullscreen());
+    }
+
+    /// Manual probe — asks the *actual* display whether fullscreen is available,
+    /// so the answer depends on what is plugged in and it cannot be a CI
+    /// assertion. Run it when a display misbehaves:
+    /// `cargo test -p ac-core -- --ignored --nocapture display_reports`
+    #[test]
+    #[ignore = "depends on the monitors attached right now"]
+    fn display_reports_whether_fullscreen_is_available() {
+        println!(
+            "main display {:?}, exclusive fullscreen available: {}",
+            display::main_resolution(),
+            display::exclusive_fullscreen_available()
+        );
+    }
+
+    #[test]
+    fn a_prefix_path_becomes_the_windows_path_explorer_needs() {
+        let prefix = PathBuf::from("/Users/h/Library/Application Support/betterac/prefix");
+        let client = prefix.join("drive_c/Turbine/Asheron's Call/acclient.exe");
+        assert_eq!(windows_path(&prefix, &client), r"C:\Turbine\Asheron's Call\acclient.exe");
+
+        // Anything outside drive_c still has to be nameable, via Wine's Z: mapping.
+        assert_eq!(windows_path(&prefix, Path::new("/opt/ac/acclient.exe")), r"Z:\opt\ac\acclient.exe");
     }
 }

@@ -60,8 +60,17 @@ pub fn launch(
 ) -> Result<Child, String> {
     validate(server, account, password)?;
 
+    // Pin AC's own resolution to the display before launching, or it renders at
+    // its 1999 default and gamescope stretches that to fill the panel -- the
+    // widescreen stretch. `BETTERAC_RESOLUTION` overrides the detected mode and
+    // drives gamescope too, so the two can never disagree about the size.
+    let resolution = crate::prefs::env_resolution().or(res);
+    if let Some((w, h)) = resolution {
+        crate::prefs::apply(&install.ac_dir, &install.prefix, (w, h), true);
+    }
+
     let gamescope = gamescope_enabled();
-    let inv = invocation(server, account, password, gamescope, &gamescope_args(res));
+    let inv = invocation(server, account, password, gamescope, &gamescope_args(resolution));
 
     let mut cmd = Command::new(&inv.program);
     cmd.args(&inv.args)

@@ -1,9 +1,10 @@
 [package]
 name = "betterac"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "A native GTK4 launcher for Asheron's Call on Linux"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 ac-core = { path = "../core" }
@@ -14,3 +15,37 @@ async-channel = "2"
 [[bin]]
 name = "betterac"
 path = "src/main.rs"
+
+# `cargo deb` reads this to build the .deb the release workflow ships.
+#
+# The runtime deps are only the toolkit: the launcher itself needs gtk4 and
+# libadwaita and nothing else. The tools it *drives* are a different matter --
+# `core/src/proton.rs` hard-fails setup without umu-run, and uses gamescope and
+# winetricks when present. umu-launcher is not packaged in Debian or Ubuntu, so
+# it cannot be a Depends without making the package uninstallable; it is called
+# out in Suggests and spelled out in the description instead.
+[package.metadata.deb]
+name = "betterac"
+maintainer = "haivk <hank@haivk.com>"
+copyright = "2026, haivk"
+section = "games"
+priority = "optional"
+depends = "libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.5)"
+recommends = "gamescope, winetricks"
+suggests = "umu-launcher"
+extended-description = """\
+A native launcher for Asheron's Call, the 1999 MMO kept alive by community-run \
+servers. Browses the live server directory, remembers an account per server, and \
+launches the Windows client through Proton.
+
+Launching the game requires umu-launcher, which is NOT packaged in Debian or \
+Ubuntu -- install it from https://github.com/Open-Wine-Components/umu-launcher \
+before first use. gamescope and winetricks are used when available."""
+assets = [
+    ["../target/release/betterac", "usr/bin/", "755"],
+    ["data/betterac.desktop", "usr/share/applications/ac.betterac.BetterAC.desktop", "644"],
+    ["data/betterac.svg", "usr/share/icons/hicolor/scalable/apps/ac.betterac.BetterAC.svg", "644"],
+    ["../packaging/shared/ac.betterac.BetterAC.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../README.md", "usr/share/doc/betterac/README.md", "644"],
+    ["../LICENSE", "usr/share/doc/betterac/LICENSE", "644"],
+]

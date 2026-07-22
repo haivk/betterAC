@@ -18,6 +18,16 @@
 resolver = "2"
 members = ["core", "gtk", "ffi"]
 
+# One version for the whole workspace, inherited by every crate. Releases are cut
+# from a git tag, and the release workflow refuses to build when the tag and this
+# disagree -- otherwise the Homebrew cask, the PKGBUILD and the AppStream
+# <release> entry all quietly describe a different build than the binary they ship.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/haivk/betterAC"
+
 # Applied to every crate in the workspace. Same knobs the single crate used.
 [profile.release]
 opt-level = "z"
