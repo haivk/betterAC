@@ -253,6 +253,46 @@ pub unsafe extern "C" fn ac_launch(
     }
 }
 
+/// What a reset would delete, as a JSON array of `{"label", "path"}`.
+///
+/// The UI lists these before asking the user to confirm, so the warning names the
+/// actual directories on this machine rather than a hardcoded description that
+/// could drift from what `ac_reset` really removes.
+#[no_mangle]
+pub extern "C" fn ac_reset_targets_json() -> *mut c_char {
+    let v: Vec<serde_json::Value> = ac_core::reset::targets()
+        .into_iter()
+        .map(|t| serde_json::json!({ "label": t.label, "path": t.path.to_string_lossy() }))
+        .collect();
+    to_c(serde_json::Value::Array(v).to_string())
+}
+
+/// Delete the install: prefix, engine, and settings. Returns null on success, or
+/// an error string. After this, `ac_detect` reports not-ready and the frontend
+/// routes back to setup.
+///
+/// Refused while a setup run is in flight — deleting the prefix out from under
+/// the thread building it would leave a mess neither side could describe.
+#[no_mangle]
+pub extern "C" fn ac_reset() -> *mut c_char {
+    {
+        let g = setup_state().lock().unwrap();
+        if g.started && !g.done {
+            return to_c("Setup is still running. Stop it before resetting.");
+        }
+    }
+    match ac_core::reset::reset() {
+        Ok(_) => {
+            // A fresh plan, not the finished state of the run that built the
+            // prefix we just deleted -- otherwise the setup screen opens showing
+            // every step already done.
+            *setup_state().lock().unwrap() = RunState::new();
+            ptr::null_mut()
+        }
+        Err(e) => to_c(e),
+    }
+}
+
 /// Free a string returned by any of the `*_json` / `*_get` / `ac_detect` /
 /// `ac_setup_poll` / `ac_config_set` / `ac_launch` calls. Null is ignored. Never
 /// call this on `ac_core_version`'s result.

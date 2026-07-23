@@ -12,10 +12,15 @@
 import SwiftUI
 
 struct LauncherView: View {
+    /// Called after a reset wipes the install, so the root can route back to
+    /// setup. Defaulted so previews and any future call site stay cheap.
+    var onReset: () -> Void = {}
+
     @State private var servers: [Server] = []
     @State private var config = Config()
     @State private var selection: Server.ID?
     @State private var loading = true
+    @State private var showingSettings = false
 
     /// Servers with a saved login, in the directory's existing order.
     private var savedServers: [Server] { servers.filter { config.entry(id: $0.id) != nil } }
@@ -41,6 +46,20 @@ struct LauncherView: View {
             }
         }
         .task { await load() }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+                .accessibilityLabel("Settings")
+            }
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsView(onReset: onReset)
+        }
     }
 
     // MARK: sidebar — the directory, saved servers pinned on top

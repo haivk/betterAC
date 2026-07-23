@@ -22,8 +22,10 @@
 //! VA = 0x400000 + offset. Each patch records the VA in its comment so the site
 //! can be found again in a disassembler.
 //!
-//! The original file is copied alongside as `acclient.exe.orig` before the first
-//! write, so a bad patch is always one `cp` away from being undone.
+//! Nothing is left behind. The patched image is built in memory, written to a
+//! temporary file beside the client, and renamed over it. The rename is atomic,
+//! so an interrupted install leaves the client either wholly unpatched or wholly
+//! patched — never truncated — and no copy of the unpatched client survives.
 
 use std::path::{Path, PathBuf};
 
@@ -135,18 +137,25 @@ pub fn apply_to_bytes(buf: &mut [u8], p: &Patch) -> Outcome {
     Outcome::Applied
 }
 
-/// Where the untouched original is kept.
-pub fn backup_path(client: &Path) -> PathBuf {
+/// Where the patched image is staged before it replaces the client.
+///
+/// Deliberately in the same directory: [`std::fs::rename`] is only atomic within
+/// a filesystem, and the system temp dir is often a different one.
+fn staging_path(client: &Path) -> PathBuf {
     let mut p = client.as_os_str().to_os_string();
-    p.push(".orig");
+    p.push(".patching");
     PathBuf::from(p)
 }
 
 /// Apply every patch in [`PATCHES`] to `client`, returning what happened to each.
 ///
-/// Writes the file only if something actually changed, and takes a `.orig` backup
-/// first. A patch that does not match is reported, not fatal: a client we do not
-/// recognise should still be playable, just without the fix.
+/// Writes only if something actually changed. A patch that does not match is
+/// reported, not fatal: a client we do not recognise should still be playable,
+/// just without the fix.
+///
+/// The rewrite is staged and renamed rather than written in place, so a crash or
+/// a full disk cannot leave a half-written executable, and no unpatched copy of
+/// the client is left on disk afterwards.
 pub fn apply_all(client: &Path) -> Result<Vec<(&'static str, Outcome)>, String> {
     let mut buf =
         std::fs::read(client).map_err(|e| format!("reading {}: {e}", client.display()))?;
@@ -158,14 +167,19 @@ pub fn apply_all(client: &Path) -> Result<Vec<(&'static str, Outcome)>, String> 
         return Ok(results);
     }
 
-    // Back up the pristine file before the first write. Never overwrite an
-    // existing backup: on a re-patch it is the only surviving original.
-    let backup = backup_path(client);
-    if !backup.exists() {
-        std::fs::copy(client, &backup)
-            .map_err(|e| format!("backing up {}: {e}", client.display()))?;
+    let staged = staging_path(client);
+    let swap = || -> std::io::Result<()> {
+        std::fs::write(&staged, &buf)?;
+        // A fresh file takes the process umask; keep whatever mode the client had.
+        let mode = std::fs::metadata(client)?.permissions();
+        std::fs::set_permissions(&staged, mode)?;
+        std::fs::rename(&staged, client)
+    };
+    if let Err(e) = swap() {
+        // Best effort: the client itself is still intact either way.
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("writing {}: {e}", client.display()));
     }
-    std::fs::write(client, &buf).map_err(|e| format!("writing {}: {e}", client.display()))?;
     Ok(results)
 }
 
@@ -231,8 +245,43 @@ mod tests {
     }
 
     #[test]
-    fn backup_sits_next_to_the_client() {
-        let b = backup_path(Path::new("/games/ac/acclient.exe"));
-        assert_eq!(b, PathBuf::from("/games/ac/acclient.exe.orig"));
+    fn staging_file_is_a_sibling_so_the_rename_stays_atomic() {
+        let s = staging_path(Path::new("/games/ac/acclient.exe"));
+        assert_eq!(s.parent(), Path::new("/games/ac/acclient.exe").parent());
+    }
+
+    #[test]
+    fn patching_leaves_nothing_behind_and_is_repeatable() {
+        let dir =
+            std::env::temp_dir().join(format!("ac-patch-{}-{:p}", std::process::id(), &PATCHES));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = dir.join("acclient.exe");
+
+        // A stand-in client: just large enough to hold every patch site.
+        let end = PATCHES.iter().map(|p| p.offset + p.expect.len()).max().unwrap();
+        let mut img = vec![0u8; end + 16];
+        for p in PATCHES {
+            img[p.offset..p.offset + p.expect.len()].copy_from_slice(p.expect);
+        }
+        std::fs::write(&client, &img).unwrap();
+
+        let first = apply_all(&client).unwrap();
+        assert!(first.iter().all(|(_, o)| *o == Outcome::Applied), "{first:?}");
+
+        let after = std::fs::read(&client).unwrap();
+        for p in PATCHES {
+            assert_eq!(&after[p.offset..p.offset + p.patched.len()], p.patched, "{}", p.name);
+        }
+
+        // The whole point: no .orig, no .patching, nothing but the client.
+        let left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left.len(), 1, "expected only acclient.exe, found {left:?}");
+
+        let again = apply_all(&client).unwrap();
+        assert!(again.iter().all(|(_, o)| *o == Outcome::AlreadyApplied), "{again:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

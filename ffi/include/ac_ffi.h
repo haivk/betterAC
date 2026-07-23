@@ -80,6 +80,21 @@ char *ac_setup_poll(void);
 // All three pointers must be null or valid NUL-terminated C strings.
 char *ac_launch(const char *server_json, const char *account, const char *password);
 
+// What a reset would delete, as a JSON array of `{"label", "path"}`.
+//
+// The UI lists these before asking the user to confirm, so the warning names the
+// actual directories on this machine rather than a hardcoded description that
+// could drift from what `ac_reset` really removes.
+char *ac_reset_targets_json(void);
+
+// Delete the install: prefix, engine, and settings. Returns null on success, or
+// an error string. After this, `ac_detect` reports not-ready and the frontend
+// routes back to setup.
+//
+// Refused while a setup run is in flight — deleting the prefix out from under
+// the thread building it would leave a mess neither side could describe.
+char *ac_reset(void);
+
 // Free a string returned by any of the `*_json` / `*_get` / `ac_detect` /
 // `ac_setup_poll` / `ac_config_set` / `ac_launch` calls. Null is ignored. Never
 // call this on `ac_core_version`'s result.

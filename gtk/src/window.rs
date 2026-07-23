@@ -179,6 +179,13 @@ pub struct App {
     account: adw::EntryRow,
     password: adw::PasswordEntryRow,
     play: gtk::Button,
+
+    /// The setup page's widgets. A reset has to put the checklist back to its
+    /// plan state -- otherwise the setup screen reopens still showing the
+    /// finished run of the install that was just deleted.
+    setup_rows: Rc<Vec<SetupRow>>,
+    setup_btn: gtk::Button,
+    setup_error: gtk::Label,
 }
 
 pub fn build(app: &adw::Application) {
@@ -290,8 +297,16 @@ pub fn build(app: &adw::Application) {
         Some("server"),
     );
 
+    // The gear sits at the top right of the window: the detail pane's bar is the
+    // one that spans the right-hand side, and it stays put as the sidebar
+    // collapses under the breakpoint.
+    let settings = gtk::Button::from_icon_name("emblem-system-symbolic");
+    settings.set_tooltip_text(Some("Settings"));
+    let detail_bar = adw::HeaderBar::new();
+    detail_bar.pack_end(&settings);
+
     let detail_view = adw::ToolbarView::new();
-    detail_view.add_top_bar(&adw::HeaderBar::new());
+    detail_view.add_top_bar(&detail_bar);
     detail_view.set_content(Some(&detail));
     let detail_page =
         adw::NavigationPage::builder().title("Asheron's Call").child(&detail_view).build();
@@ -388,7 +403,15 @@ pub fn build(app: &adw::Application) {
         account,
         password,
         play,
+        setup_rows: setup_rows.clone(),
+        setup_btn: setup_btn.clone(),
+        setup_error: setup_error.clone(),
     });
+
+    {
+        let ui = ui.clone();
+        settings.connect_clicked(move |_| ui.clone().open_settings());
+    }
 
     // The game isn't installed: pressing the button runs setup on a background
     // thread and streams progress here, rather than sending the user off to a
@@ -612,6 +635,128 @@ impl App {
         // Play was insensitive while there was nothing to launch.
         self.play.set_sensitive(self.selected.borrow().is_some());
         self.stack.set_visible_child_name("games");
+    }
+
+    /// The settings window: what version this is, and the reset escape hatch.
+    ///
+    /// The list of things a reset deletes is read from `ac_core::reset::targets`
+    /// rather than written out here, so the warning always names the directories
+    /// that will actually be removed on this machine.
+    fn open_settings(self: Rc<Self>) {
+        let win = adw::PreferencesWindow::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Settings")
+            .search_enabled(false)
+            .default_width(560)
+            .default_height(520)
+            .build();
+
+        let page = adw::PreferencesPage::new();
+
+        let about = adw::PreferencesGroup::builder().title("About").build();
+        let version = adw::ActionRow::builder()
+            .title("betterAC")
+            .subtitle(env!("CARGO_PKG_VERSION"))
+            .build();
+        version.add_css_class("property");
+        about.add(&version);
+        page.add(&about);
+
+        let group = adw::PreferencesGroup::builder()
+            .title("Reset")
+            .description(
+                "Delete the Windows prefix, the installed game and your saved servers, then \
+                 run setup again from scratch. Downloaded installers are kept, so setting up \
+                 again does not download them a second time.",
+            )
+            .build();
+        for t in ac_core::reset::targets() {
+            let row = adw::ActionRow::builder()
+                .title(t.label)
+                .subtitle(t.path.to_string_lossy().as_ref())
+                .build();
+            row.add_css_class("property");
+            row.set_subtitle_lines(2);
+            group.add(&row);
+        }
+
+        let btn = gtk::Button::with_label("Reset Installation…");
+        btn.add_css_class("destructive-action");
+        btn.add_css_class("pill");
+        btn.set_halign(gtk::Align::Center);
+        btn.set_margin_top(12);
+        group.add(&btn);
+        page.add(&group);
+
+        win.add(&page);
+        win.present();
+
+        let ui = self.clone();
+        let parent = win.clone();
+        btn.connect_clicked(move |_| ui.clone().confirm_reset(&parent));
+    }
+
+    /// Second gate on an irreversible action: the button opens this, this does it.
+    fn confirm_reset(self: Rc<Self>, parent: &adw::PreferencesWindow) {
+        let dialog = adw::MessageDialog::new(
+            Some(parent),
+            Some("Reset the installation?"),
+            Some(
+                "This deletes the installed game, the Windows prefix and your saved servers \
+                 and passwords. It cannot be undone.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("reset", "Reset")]);
+        dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let ui = self.clone();
+        let parent = parent.clone();
+        dialog.connect_response(None, move |d, response| {
+            d.close();
+            if response != "reset" {
+                return;
+            }
+            parent.close();
+            ui.clone().do_reset();
+        });
+        dialog.present();
+    }
+
+    /// Delete the install and put the window back where a first run starts.
+    ///
+    /// This is the mirror of `finish_setup`: that one re-discovers and moves to
+    /// the launcher, this one un-discovers and moves to setup.
+    fn do_reset(self: Rc<Self>) {
+        if let Err(e) = ac_core::reset::reset() {
+            self.toast(&e);
+            return;
+        }
+
+        // The config file is gone, so this reloads defaults -- which puts `prefix`
+        // back to the path a fresh setup would build.
+        *self.cfg.borrow_mut() = Config::load();
+        let prefix = self.cfg.borrow().prefix.clone();
+        *self.install.borrow_mut() = ProtonRuntime::new(prefix).discover();
+
+        // Drop the launcher's per-server state before the saved list changes under
+        // it: this clears the credential fields and the detail pane.
+        self.select(None);
+        self.refresh_list();
+        self.play.set_sensitive(false);
+
+        // Back to the plan: every step visible and pending, not the queue left
+        // over from the run that built what we just deleted.
+        update_rows(&self.setup_rows, &RunState::new(), false);
+        self.setup_error.set_visible(false);
+        self.setup_btn.set_label("Set up Asheron's Call");
+        self.setup_btn.set_visible(true);
+        self.setup_btn.set_sensitive(true);
+
+        self.stack.set_visible_child_name("setup");
+        self.toast("Installation reset.");
     }
 
     /// Put the directory on screen: the bundled snapshot immediately, then the

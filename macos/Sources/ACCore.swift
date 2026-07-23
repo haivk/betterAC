@@ -70,6 +70,15 @@ enum ACCore {
         decode(SetupRun.self, from: take(ac_setup_poll())) ?? SetupRun()
     }
 
+    /// What a reset would delete, for the confirmation list. Cheap; reads config.
+    static func resetTargets() -> [ResetTarget] {
+        decode([ResetTarget].self, from: take(ac_reset_targets_json())) ?? []
+    }
+
+    /// Delete the prefix, engine and settings. Returns nil on success, or an
+    /// error string. Touches a lot of disk — call off the main thread.
+    static func reset() -> String? { take(ac_reset()) }
+
     /// Launch the client. Returns nil on a successful spawn, or an error string.
     static func launch(server: Server, account: String, password: String) -> String? {
         guard let data = try? encoder.encode(server),

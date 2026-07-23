@@ -18,6 +18,7 @@ pub mod install;
 pub mod patches;
 pub mod prefs;
 pub mod proton;
+pub mod reset;
 pub mod servers;
 pub mod setup;
 

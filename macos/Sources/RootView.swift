@@ -13,7 +13,9 @@ struct RootView: View {
                 ProgressView("Checking your installation…")
                     .controlSize(.large)
             case .some(let d) where d.ready:
-                LauncherView()
+                // A reset deletes the install, so re-detecting is what swaps this
+                // for the setup screen.
+                LauncherView(onReset: redetect)
             case .some:
                 SetupView(onComplete: redetect)
             }

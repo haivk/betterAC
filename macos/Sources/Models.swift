@@ -87,6 +87,17 @@ struct Config: Codable {
     }
 }
 
+/// One thing `ac_reset` will delete. Mirrors `reset::Target`.
+///
+/// The paths come from the Rust side rather than being rebuilt here, so the
+/// warning always names what will actually be removed.
+struct ResetTarget: Codable, Identifiable {
+    let label: String
+    let path: String
+
+    var id: String { path }
+}
+
 /// Result of `ac_detect`.
 struct DetectResult: Codable {
     let ready: Bool
