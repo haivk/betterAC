@@ -41,6 +41,13 @@ pub struct Patch {
     pub expect: &'static [u8],
     /// Bytes to write. Must be the same length as `expect`.
     pub patched: &'static [u8],
+    /// Skip this patch when the client is not going to run under macOS/Wine.
+    ///
+    /// The two window-style patches below only make sense there: they exist to get
+    /// a macOS fullscreen Space out of winemac.drv. On Linux AC runs fullscreen
+    /// inside gamescope and never shows a window frame at all, so leaving the Linux
+    /// client byte-identical keeps that path exactly as it was.
+    pub macos_only: bool,
 }
 
 /// Every patch we apply, in order.
@@ -89,6 +96,100 @@ pub struct Patch {
 /// The two sites are adjacent but disjoint — 0x4d6f33..0x4d6f3a and
 /// 0x4d6f3b..0x4d6f42 — and `edi` is loaded with the device at 0x4d6f23, before
 /// either, so it is live for both.
+///
+/// ## login-resolution (VA 0x4393d0, macOS only)
+///
+/// AC's splash, login and character-select screens pin themselves to 800x600 and
+/// ignore the configured resolution, so without this the client would spend the
+/// first part of every session as a small window and only reach full size on world
+/// entry.
+///
+/// The pinning goes through `SetForcedResolution(force, w, h)` (0x43a990), which
+/// three callers invoke with a hardcoded `(1, 800, 600)`. It writes a flag at
+/// 0x8381a0 and the size at 0x818b04/0x818b08, and `GetDesiredDisplayMode`
+/// (0x439370) — the single source of truth for *both* window sizing and device
+/// creation — then overrides the configured resolution with it:
+///
+/// ```text
+///   8a 0d a0 81 83 00     mov cl,[0x8381a0]   ; the force flag
+///   84 c9                 test cl,cl
+///   74 12                 je 0x4393e4         ; -> jmp: skip the override always
+///   8b 15 04 8b 81 00     mov edx,[0x818b04]  ; forced width  (800)
+///   …
+/// ```
+///
+/// One byte — `je` becomes `jmp` — makes the override unreachable, so every screen
+/// falls back to the configured resolution, which [`crate::prefs::apply`] pins to
+/// the display size on every launch. That is the same value the in-world view
+/// already renders at, so nothing new has to be validated.
+///
+/// Patched here rather than at the three call sites: those are scattered (0x4049ab,
+/// 0x4ead23, 0x4eafe1) and only two of them share a searchable byte pattern, while
+/// this one site covers every caller.
+///
+/// What this does **not** fix, measured rather than assumed: those screens still
+/// *draw* at 800x600. A wined3d trace shows the backbuffer and the only viewport are
+/// both the full display size, so the 800x600 is the UI layout itself — fixed-pixel
+/// artwork anchored top-left — and it sits in the top-left corner of the window.
+/// There is no lever to change that: the forced-resolution globals have exactly four
+/// code references each, all inside the display-mode functions, so nothing in the UI
+/// reads them. The alternative (leave the screens at an 800x600 device and let
+/// wined3d stretch that backbuffer over the window) fills the screen but ignores
+/// aspect, which distorts 4:3 art on a widescreen display.
+///
+/// Known side effect: the `ForceDisplayResolution` console command (registered at
+/// 0x43bf3e) stops taking effect. It was never confirmed to work in the first place
+/// — it only resizes the window, so it could never rescue a failed device anyway.
+///
+/// ## window-style-create (VA 0x43bc0b) and window-style-restyle (VA 0x43a577), macOS only
+///
+/// Two changes to the style of AC's window, for the price of one immediate each:
+///
+///   * **add `WS_THICKFRAME|WS_MAXIMIZEBOX`.** winemac.drv only grants a window the
+///     native macOS fullscreen capability (`NSWindowCollectionBehaviorFullScreenPrimary`
+///     — the green button, and with it the ability to live in its own Space) when the
+///     Win32 style has a resizable frame. AC never sets one, so its window could only
+///     ever be the borderless display-covering overlay.
+///   * **drop `WS_MINIMIZEBOX`.** winemac maps it to
+///     `NSWindowStyleMaskMiniaturizable`; without it the yellow button is disabled and
+///     Cmd-M does nothing, so the game cannot be minimised out from under the player.
+///
+/// AC builds that style branchlessly, in two places that mirror each other: once
+/// for the `dwStyle` it hands `CreateWindowExA` (0x43bd30), and once for the
+/// `SetWindowLongA` inside `ApplyDisplayMode` (0x43a510).
+///
+/// ```text
+///   creation:  and edx,0x80ca0000 ; add edx,0x82000000     [| WS_VISIBLE later]
+///   restyle:   and eax,0x7f360000 ; add eax,0x12ca0000
+/// ```
+///
+/// A `neg`/`sbb` on a flag leaves the register 0 or -1 first, so one style is the
+/// *add* immediate alone and the other is mask+add. Note the two sites test
+/// *opposite* flags — the creation site asks "is windowed", the restyle site asks
+/// "is fullscreen" — so which immediate is which swaps between them. Either way
+/// both end up at 0x92000000 fullscreen (a popup overlay) and 0x12CA0000 windowed:
+/// caption, sysmenu, minimize box, and no `WS_THICKFRAME`. (The creation site ORs
+/// in `WS_VISIBLE` separately, a few instructions later.)
+///
+/// Both patches move the windowed result from 0x12CA0000 to 0x12CD0000 (+0x50000
+/// frame, -0x20000 minimize box) while leaving the fullscreen one bit-identical, so
+/// `BETTERAC_FULLSCREEN` and the virtual `Desktop` mode are untouched:
+///
+/// ```text
+///   creation:  and edx,0x80cd0000   (add unchanged: there it *is* the fullscreen style)
+///   restyle:   and eax,0x7f330000 ; add eax,0x12cd0000
+/// ```
+///
+/// The creation site is the one that does the work — measured on a live client,
+/// `ApplyDisplayMode` never runs during a normal session, because the login screen
+/// asks for its mode before the render backend exists and `SetForcedResolution`
+/// (0x43a990) returns early on a null 0x86734c. The restyle site is patched anyway
+/// so that a window AC *does* restyle later keeps its frame instead of silently
+/// losing the Space.
+///
+/// Between them AC applies the frame itself, which is what let the old
+/// `acwindow.exe` helper — a Win32 process that polled for the window and re-added
+/// the bits from outside — be deleted outright.
 pub const PATCHES: &[Patch] = &[
     Patch {
         name: "widescreen-viewport",
@@ -96,6 +197,7 @@ pub const PATCHES: &[Patch] = &[
         offset: 0x0D_6F3B,
         expect: &[0x8b, 0xce, 0xe8, 0x1e, 0x8f, 0x1c, 0x00],
         patched: &[0x8b, 0xcf, 0xe8, 0xde, 0x8d, 0x07, 0x00],
+        macos_only: false,
     },
     Patch {
         name: "viewport-height",
@@ -103,6 +205,31 @@ pub const PATCHES: &[Patch] = &[
         offset: 0x0D_6F33,
         expect: &[0x8b, 0xce, 0xe8, 0x36, 0x8f, 0x1c, 0x00],
         patched: &[0x8b, 0xcf, 0xe8, 0xf6, 0x8d, 0x07, 0x00],
+        macos_only: false,
+    },
+    Patch {
+        name: "login-resolution",
+        why: "brings the login and character-select screens up at the display resolution",
+        offset: 0x03_93C8,
+        expect: &[0x8a, 0x0d, 0xa0, 0x81, 0x83, 0x00, 0x84, 0xc9, 0x74, 0x12],
+        patched: &[0x8a, 0x0d, 0xa0, 0x81, 0x83, 0x00, 0x84, 0xc9, 0xeb, 0x12],
+        macos_only: true,
+    },
+    Patch {
+        name: "window-style-create",
+        why: "lets macOS give the game window its own fullscreen Space, and stops it minimising",
+        offset: 0x03_BC0B,
+        expect: &[0x81, 0xe2, 0x00, 0x00, 0xca, 0x80, 0x81, 0xc2, 0x00, 0x00, 0x00, 0x82],
+        patched: &[0x81, 0xe2, 0x00, 0x00, 0xcd, 0x80, 0x81, 0xc2, 0x00, 0x00, 0x00, 0x82],
+        macos_only: true,
+    },
+    Patch {
+        name: "window-style-restyle",
+        why: "keeps that window style when the client re-applies it",
+        offset: 0x03_A577,
+        expect: &[0x25, 0x00, 0x00, 0x36, 0x7f, 0x05, 0x00, 0x00, 0xca, 0x12],
+        patched: &[0x25, 0x00, 0x00, 0x33, 0x7f, 0x05, 0x00, 0x00, 0xcd, 0x12],
+        macos_only: true,
     },
 ];
 
@@ -147,7 +274,14 @@ fn staging_path(client: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Apply every patch in [`PATCHES`] to `client`, returning what happened to each.
+/// The patches that apply on this platform — everything in [`PATCHES`] except the
+/// [`macos_only`](Patch::macos_only) ones when the client will not run under
+/// macOS/Wine.
+pub fn applicable() -> impl Iterator<Item = &'static Patch> {
+    PATCHES.iter().filter(|p| !p.macos_only || cfg!(target_os = "macos"))
+}
+
+/// Apply every patch in [`applicable`] to `client`, returning what happened to each.
 ///
 /// Writes only if something actually changed. A patch that does not match is
 /// reported, not fatal: a client we do not recognise should still be playable,
@@ -161,7 +295,7 @@ pub fn apply_all(client: &Path) -> Result<Vec<(&'static str, Outcome)>, String> 
         std::fs::read(client).map_err(|e| format!("reading {}: {e}", client.display()))?;
 
     let results: Vec<(&'static str, Outcome)> =
-        PATCHES.iter().map(|p| (p.name, apply_to_bytes(&mut buf, p))).collect();
+        applicable().map(|p| (p.name, apply_to_bytes(&mut buf, p))).collect();
 
     if !results.iter().any(|(_, o)| *o == Outcome::Applied) {
         return Ok(results);
@@ -193,6 +327,7 @@ mod tests {
         offset: 4,
         expect: &[0xaa, 0xbb],
         patched: &[0x90, 0x90],
+        macos_only: false,
     };
 
     #[test]
@@ -241,6 +376,101 @@ mod tests {
             let (_, a_end, a) = w[0];
             let (b_start, _, b) = w[1];
             assert!(a_end <= b_start, "{a} overlaps {b}");
+        }
+    }
+
+    fn named(name: &str) -> &'static Patch {
+        PATCHES.iter().find(|p| p.name == name).expect("no such patch")
+    }
+
+    /// Both window-style patches are arithmetic, and getting an immediate wrong
+    /// would either lose the resizable frame (no Space) or corrupt the exclusive
+    /// fullscreen style. Decode the instructions and check the styles the client
+    /// actually ends up with, rather than trusting the hex by eye.
+    #[test]
+    fn the_style_patches_only_touch_the_windowed_style() {
+        const WS_VISIBLE: u32 = 0x1000_0000;
+        const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
+        const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+        const WS_THICKFRAME: u32 = 0x0004_0000;
+
+        // Both sites are an `and imm32` / `add imm32` pair on a register set to 0 or
+        // -1 by a neg/sbb on a flag, so one style is `add` alone and the other is
+        // mask+add. They differ in encoding *and* in the sense of that flag: the
+        // restyle site tests "is fullscreen" on eax (`25`/`05`), the creation site
+        // tests "is windowed" on edx (`81 e2`/`81 c2`), so the two styles come out
+        // the opposite way round. The creation site ORs in WS_VISIBLE afterwards, so
+        // normalise both by setting it.
+        let styles = |b: &[u8]| {
+            let (mask_at, add_at, add_is_windowed) = match (b[0], b[1]) {
+                (0x25, _) => {
+                    assert_eq!(b[5], 0x05, "expected `add eax,imm32` after `and eax,imm32`");
+                    (1, 6, true)
+                }
+                (0x81, 0xe2) => {
+                    assert_eq!(&b[6..8], &[0x81, 0xc2], "expected `add edx,imm32`");
+                    (2, 8, false)
+                }
+                _ => panic!("not an and/add immediate pair: {b:02x?}"),
+            };
+            let imm = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let (mask, base) = (imm(mask_at), imm(add_at));
+            let (a, b) = (base | WS_VISIBLE, mask.wrapping_add(base) | WS_VISIBLE);
+            if add_is_windowed { (b, a) } else { (a, b) } // (fullscreen, windowed)
+        };
+
+        for name in ["window-style-create", "window-style-restyle"] {
+            let p = named(name);
+            let (was_fullscreen, was_windowed) = styles(p.expect);
+            let (now_fullscreen, now_windowed) = styles(p.patched);
+
+            assert_eq!(was_windowed, 0x12CA_0000, "{name}: the client's windowed style moved");
+            assert_eq!(was_fullscreen, 0x9200_0000, "{name}: the client's fullscreen style moved");
+            assert_eq!(
+                now_fullscreen, was_fullscreen,
+                "{name}: exclusive fullscreen must come out bit-identical -- \
+                 BETTERAC_FULLSCREEN and BETTERAC_DESKTOP use it"
+            );
+            assert_eq!(
+                now_windowed & !was_windowed,
+                WS_THICKFRAME | WS_MAXIMIZEBOX,
+                "{name}: the windowed style must gain exactly the frame winemac looks for"
+            );
+            assert_eq!(
+                was_windowed & !now_windowed,
+                WS_MINIMIZEBOX,
+                "{name}: the minimize box must be the only thing removed"
+            );
+        }
+    }
+
+    /// The login fix is one opcode: `je` over the forced-resolution override
+    /// becomes `jmp`. Anything else at this site would be writing into the wrong
+    /// instruction, so pin the shape.
+    #[test]
+    fn the_login_patch_only_turns_the_conditional_jump_into_an_unconditional_one() {
+        let p = named("login-resolution");
+        let differ: Vec<usize> =
+            (0..p.expect.len()).filter(|&i| p.expect[i] != p.patched[i]).collect();
+        assert_eq!(differ, vec![8], "only the jump opcode may change");
+        assert_eq!((p.expect[8], p.patched[8]), (0x74, 0xeb), "je -> jmp");
+        assert_eq!(p.expect[9], p.patched[9], "the jump displacement must not move");
+    }
+
+    /// The macOS-only patches change how the client windows itself, which is
+    /// meaningless (and unwanted) under gamescope. Guard the split so a future
+    /// patch does not silently reach the Linux client.
+    #[test]
+    fn only_the_window_patches_are_macos_only() {
+        let mac: Vec<&str> = PATCHES.iter().filter(|p| p.macos_only).map(|p| p.name).collect();
+        assert_eq!(mac, vec!["login-resolution", "window-style-create", "window-style-restyle"]);
+
+        let applied: Vec<&str> = applicable().map(|p| p.name).collect();
+        if cfg!(target_os = "macos") {
+            assert_eq!(applied.len(), PATCHES.len());
+        } else {
+            assert!(!applied.contains(&"window-style-create"), "{applied:?}");
+            assert!(applied.contains(&"widescreen-viewport"), "{applied:?}");
         }
     }
 

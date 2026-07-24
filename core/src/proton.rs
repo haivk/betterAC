@@ -336,11 +336,12 @@ impl ProtonRuntime {
     /// [`crate::patches`]. Runs after the update bundle, because that is what puts
     /// the client we patch in place. A patch that does not recognise the build is
     /// reported and skipped, never fatal: an unpatched client is still playable.
+    ///
+    /// Deliberately *not* short-circuited on its stamp, unlike every other step:
+    /// [`patches::apply_all`] is idempotent and only rewrites the file when a byte
+    /// actually changed, so re-running it costs one read of a 4.8 MB file and means
+    /// a patch added in a later release lands on installs that are already set up.
     fn step_patch_client(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
-        if is_stamped(&self.prefix, SetupStep::PatchClient) {
-            on(Progress::skipped(SetupStep::PatchClient, "the client is already patched"));
-            return Ok(());
-        }
         let game_dir =
             find_game_dir(&self.prefix).ok_or("game directory not found for patching the client")?;
         let client = find_acclient(&game_dir)

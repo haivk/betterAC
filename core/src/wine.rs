@@ -28,8 +28,8 @@
 //!   * **The prefix is set to Windows 7**, which is the version the smoke test bottle
 //!     ran as.
 //!
-//! Display-resolution handling (the widescreen-stretch fix) is a known follow-up:
-//! `launch` takes a `res` for signature parity with Proton but does not yet use it.
+//! How AC gets the screen — the display resolution, the fullscreen Space, and the
+//! escape hatches around both — is documented on [`launch`] and [`LaunchMode`].
 
 use crate::args::{client_args, validate};
 use crate::fetch::{download, extract_tar_gz, extract_zip, verify_sha256};
@@ -41,6 +41,11 @@ use crate::servers::Server;
 use crate::setup::{is_stamped, mark_stamped, Progress, Runtime, SetupStep};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+/// The macOS "fullscreen Space" helper, embedded so a launch needs nothing on disk
+/// to provision. Built from `macos/helpers/acspaces.m` by `build.rs`, and written to
+/// the support dir on first use by [`ensure_spaces_helper`].
+const ACSPACES_DYLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/acspaces.dylib"));
 
 /// The Wine engine we self-provision: the CrossOver-lineage build from the active
 /// Whisky fork (`frankea/Whisky`), the exact lineage Step Zero validated AC on.
@@ -316,11 +321,12 @@ impl WineRuntime {
     /// [`crate::patches`]. Runs after the update bundle, because that is what puts
     /// the client we patch in place. A patch that does not recognise the build is
     /// reported and skipped, never fatal: an unpatched client is still playable.
+    ///
+    /// Deliberately *not* short-circuited on its stamp, unlike every other step:
+    /// [`patches::apply_all`] is idempotent and only rewrites the file when a byte
+    /// actually changed, so re-running it costs one read of a 4.8 MB file and means
+    /// a patch added in a later release lands on installs that are already set up.
     fn step_patch_client(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
-        if is_stamped(&self.prefix, SetupStep::PatchClient) {
-            on(Progress::skipped(SetupStep::PatchClient, "the client is already patched"));
-            return Ok(());
-        }
         let game_dir =
             find_game_dir(&self.prefix).ok_or("game directory not found for patching the client")?;
         let client = find_acclient(&game_dir)
@@ -396,33 +402,47 @@ impl Runtime for WineRuntime {
 ///
 /// ## Avoiding the widescreen stretch
 ///
-/// AC reads its resolution from `UserPreferences.ini`; with no such file it
-/// defaults to a resolution that rarely matches the panel, and the Mac Wine
-/// driver stretches the result to fill the screen (very visible on an ultrawide).
-/// The fix is two coupled parts, both keyed on the display's real resolution:
-///
-///   1. **Write `UserPreferences.ini`** so AC renders at the display resolution
-///      and correct aspect (see [`ensure_display_prefs`]). Never overwrites an
-///      existing file unless the user forced a size via `BETTERAC_RESOLUTION`.
-///   2. **Run inside a Wine virtual desktop** of the same size. Exclusive
-///      fullscreen mode-switching is unreliable on Retina/scaled displays; a
-///      virtual desktop renders into a window of exactly that size instead, so
-///      there is no mode switch to stretch. AC fills it because its resolution
-///      (from step 1) matches.
+/// AC reads its resolution from `UserPreferences.ini`; with no such file it defaults
+/// to a resolution that rarely matches the panel, and the Mac Wine driver stretches
+/// the result to fill the screen (very visible on an ultrawide). So every launch
+/// writes that file with the display's real resolution — [`crate::prefs::apply`],
+/// enforced each time because AC rewrites the file on a clean exit and would
+/// otherwise carry its last session's mode into the next one. With AC's own
+/// resolution pinned to the display there is nothing left for anything to stretch.
 ///
 /// Resolution is taken from `BETTERAC_RESOLUTION` (WxH), else the `res` argument,
 /// else the main display (CoreGraphics).
 ///
-/// The screen mode is chosen per display, not fixed — see [`LaunchMode`] for the
-/// measurements behind it. Where the Mac driver can give AC a real fullscreen
-/// device it gets one; where it cannot (a MacBook's built-in panel offers no 4:3
-/// mode, and AC refuses to create a device without one) AC runs fullscreen inside
-/// a Wine virtual desktop, which synthesises the modes it wants.
+/// ## The default: a native macOS fullscreen Space
 ///
-/// Escape hatches: `BETTERAC_WINDOWED=1` forces a plain window (AC then pins
-/// itself to 800x600); `BETTERAC_DESKTOP=1` forces the virtual desktop;
-/// `BETTERAC_FULLSCREEN=1` demands real fullscreen even where we expect it to
-/// fail; `BETTERAC_RESOLUTION=WxH` forces a size.
+/// By default AC runs in [`LaunchMode::Spaces`]: windowed at the display resolution
+/// (step 1 above, with `FullScreen=False`), in its own fullscreen Space that slides
+/// aside on alt-tab rather than the borderless overlay exclusive fullscreen
+/// produces. Three pieces make that work, and two of them are byte patches applied
+/// at setup (see [`crate::patches`]):
+///
+///   * **`window-style-create` / `window-style-restyle`** put `WS_THICKFRAME` in the
+///     style AC gives its own window. winemac only grants a window the native
+///     fullscreen capability (`NSWindowCollectionBehaviorFullScreenPrimary`) once it
+///     has a resizable frame, and AC never set one. They also drop `WS_MINIMIZEBOX`,
+///     so the game cannot be minimised out from under the player.
+///   * **`login-resolution`** removes the client's hardcoded 800x600 for the splash,
+///     login and character-select screens, so the whole session is one window at one
+///     size, fullscreen from the first frame. (Those screens still *draw* their UI at
+///     800x600 in the top-left — that is fixed-pixel artwork with no scaling hook;
+///     see the patch's notes.)
+///   * **`acspaces.dylib`** is injected into the Wine process via
+///     `DYLD_INSERT_LIBRARIES` and, from *inside* that process (so no Accessibility
+///     permission), calls the window's own `-toggleFullScreen:` once it is capable.
+///
+/// The dylib is provisioned by [`ensure_spaces_helper`]; if it can't be written the
+/// launch still proceeds, just as a plain window the user can fullscreen by hand.
+///
+/// Escape hatches (all skip the dylib, so none of them auto-fullscreen):
+/// `BETTERAC_WINDOWED=1` forces a plain window; `BETTERAC_DESKTOP=1` forces the Wine
+/// virtual desktop (the fallback for a MacBook's built-in panel, which offers no 4:3
+/// mode for an exclusive-fullscreen device); `BETTERAC_FULLSCREEN=1` demands the old
+/// exclusive-fullscreen overlay; `BETTERAC_RESOLUTION=WxH` forces a size.
 pub fn launch(
     install: &Install,
     server: &Server,
@@ -441,7 +461,6 @@ pub fn launch(
         env_flag("BETTERAC_WINDOWED"),
         env_flag("BETTERAC_DESKTOP"),
         env_flag("BETTERAC_FULLSCREEN"),
-        display::exclusive_fullscreen_available,
     );
 
     if let Some((w, h)) = resolution {
@@ -468,6 +487,11 @@ pub fn launch(
     argv.push(client);
     argv.extend(client_args(server, account, password));
 
+    // In Spaces mode, provision the dylib that puts AC's window in a native macOS
+    // fullscreen Space (see [`launch`] docs and [`ensure_spaces_helper`]). If it
+    // can't be written we still launch — AC just comes up as a plain window.
+    let spaces_dylib = matches!(mode, LaunchMode::Spaces).then(ensure_spaces_helper).flatten();
+
     // `install.proton` holds the wine binary on macOS (see `discover`).
     let mut cmd = Command::new(&install.proton);
     cmd.args(&argv)
@@ -477,14 +501,48 @@ pub fn launch(
         // never engaged, so there is no native d3d9 to prefer and no Vulkan layer.
         .env("WINEDLLOVERRIDES", "d3d9=b")
         .env("WINEDEBUG", "-all");
+    if let Some(dylib) = &spaces_dylib {
+        // Inject the auto-fullscreen dylib into the Wine process. It calls AC's own
+        // window's -toggleFullScreen: from *inside* the process, so no Accessibility
+        // permission is needed. Must exec wine directly (Command does) — going via a
+        // SIP-restricted binary like `nohup` would make dyld strip this.
+        cmd.env("DYLD_INSERT_LIBRARIES", dylib);
+    }
 
-    cmd.spawn().map_err(|e| {
+    let child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("The Wine engine is missing at {}. Run setup again.", install.proton.display())
         } else {
             format!("Could not start the client: {e}")
         }
-    })
+    })?;
+
+    Ok(child)
+}
+
+/// Write the embedded macOS fullscreen-Space dylib to the support dir and return its
+/// path. Idempotent and cheap: the file is rewritten only when its bytes differ from
+/// what is already there, so relaunches don't churn the disk. Returns `None` if it
+/// can't be written — the caller then launches without the auto-Space rather than
+/// failing.
+fn ensure_spaces_helper() -> Option<PathBuf> {
+    let dir = crate::install::support_dir().join("helpers");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dylib = dir.join("acspaces.dylib");
+    write_if_changed(&dylib, ACSPACES_DYLIB)?;
+    // The Win32 style helper that used to live here is gone -- AC now applies the
+    // resizable frame itself (the `resizable-window` patch). Clean up after upgrades.
+    let _ = std::fs::remove_file(dir.join("acwindow.exe"));
+    Some(dylib)
+}
+
+/// Write `bytes` to `path` only if the file is absent or its contents differ.
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Option<()> {
+    let up_to_date = std::fs::read(path).is_ok_and(|cur| cur == bytes);
+    if !up_to_date {
+        std::fs::write(path, bytes).ok()?;
+    }
+    Some(())
 }
 
 /// How AC gets its screen.
@@ -521,37 +579,46 @@ pub fn launch(
 /// refresh rate, and an active macOS fullscreen Space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchMode {
-    /// Real exclusive fullscreen. Only where the display can actually do it.
+    /// The default: AC runs windowed at the display resolution, in a native macOS
+    /// fullscreen **Space** it puts itself into (see [`launch`]). This is the
+    /// modern-Mac-game behaviour — its own Space that slides aside on alt-tab —
+    /// instead of the overlay [`Fullscreen`](Self::Fullscreen) produces. Works on
+    /// every display: windowed needs no exclusive adapter mode, so it also sidesteps
+    /// the built-in-panel problem that [`Desktop`](Self::Desktop) exists for.
+    Spaces,
+    /// Real exclusive fullscreen — a borderless window that *overlays* the current
+    /// Space. Only on request now (`BETTERAC_FULLSCREEN`); superseded by
+    /// [`Spaces`](Self::Spaces) as the default.
     Fullscreen,
-    /// Fullscreen inside a Wine virtual desktop — the fallback that makes the
+    /// Fullscreen inside a Wine virtual desktop — the old fallback that makes the
     /// built-in panel work, and no worse than a window anywhere else.
     Desktop,
-    /// A plain window. Only on request: AC ignores `Resolution` when windowed and
-    /// pins itself to 800x600.
+    /// A plain window at the display resolution — [`Spaces`](Self::Spaces) minus the
+    /// automatic Space. Only on request, for when the game should stay on the
+    /// current desktop; the window is resizable, so it can still be fullscreened by
+    /// hand from the green button.
     Windowed,
 }
 
 impl LaunchMode {
-    /// Explicit user intent first, then what the display can do. Falling back to
-    /// [`LaunchMode::Desktop`] rather than [`LaunchMode::Windowed`] matters: the
-    /// window AC gives us is a fixed 800x600, the virtual desktop fills the screen.
-    fn choose(
-        force_windowed: bool,
-        force_desktop: bool,
-        force_fullscreen: bool,
-        available: impl Fn() -> bool,
-    ) -> Self {
+    /// Explicit user intent first, otherwise the [`Spaces`](Self::Spaces) default.
+    /// The default used to be decided by the display — exclusive `Fullscreen` where
+    /// the adapter mode list allowed it, else `Desktop`. `Spaces` is windowed
+    /// underneath, so it needs no exclusive mode and works on every display; the
+    /// probe that answered that question is gone with it.
+    fn choose(force_windowed: bool, force_desktop: bool, force_fullscreen: bool) -> Self {
         match (force_windowed, force_desktop, force_fullscreen) {
             (true, _, _) => Self::Windowed,
             (_, true, _) => Self::Desktop,
             (_, _, true) => Self::Fullscreen,
-            _ if available() => Self::Fullscreen,
-            _ => Self::Desktop,
+            _ => Self::Spaces,
         }
     }
 
-    /// What to write to AC's `FullScreen` key. True inside a virtual desktop too —
-    /// that is what makes its device creation succeed.
+    /// What to write to AC's `FullScreen` key. `Spaces` is windowed (False): AC must
+    /// be a normal resizable window for macOS to give it a Space; only exclusive
+    /// `Fullscreen` and the virtual `Desktop` (where True makes device creation
+    /// succeed) get True.
     fn ac_fullscreen(self) -> bool {
         matches!(self, Self::Fullscreen | Self::Desktop)
     }
@@ -620,28 +687,11 @@ fn contain_user_profile(prefix: &Path) {
 /// returns points (the "looks like" resolution) rather than raw Retina pixels,
 /// which is exactly the size we want AC to render at.
 mod display {
-    use std::os::raw::c_void;
-
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGMainDisplayID() -> u32;
         fn CGDisplayPixelsWide(display: u32) -> usize;
         fn CGDisplayPixelsHigh(display: u32) -> usize;
-        fn CGDisplayIsBuiltin(display: u32) -> i32;
-        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
-        fn CGDisplayModeRelease(mode: *mut c_void);
-        fn CGDisplayCopyAllDisplayModes(display: u32, options: *const c_void) -> *const c_void;
-        fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
-        fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
-        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
-        fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFArrayGetCount(array: *const c_void) -> isize;
-        fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
-        fn CFRelease(cf: *const c_void);
     }
 
     pub fn main_resolution() -> Option<(i32, i32)> {
@@ -650,56 +700,6 @@ mod display {
             let id = CGMainDisplayID();
             let (w, h) = (CGDisplayPixelsWide(id), CGDisplayPixelsHigh(id));
             (w > 0 && h > 0).then_some((w as i32, h as i32))
-        }
-    }
-
-    /// Can this display give AC an exclusive-fullscreen D3D9 device?
-    ///
-    /// Two conditions, both observed rather than derived — see
-    /// [`can_go_exclusive_fullscreen`] for the measurements:
-    ///
-    ///   1. the display is **not** the machine's built-in panel, and
-    ///   2. the desktop's current logical size also exists as a 1:1 mode
-    ///      (`pixelWidth == width`).
-    ///
-    /// The answer changes when a monitor is plugged in or unplugged, so this is
-    /// asked on every launch and never cached.
-    pub fn exclusive_fullscreen_available() -> bool {
-        // SAFETY: `CGDisplayCopyDisplayMode`/`CGDisplayCopyAllDisplayModes` return
-        // owned references (null on failure), released below; the getters only read
-        // a mode we still hold.
-        unsafe {
-            let id = CGMainDisplayID();
-            if CGDisplayIsBuiltin(id) != 0 {
-                return false;
-            }
-            let current = CGDisplayCopyDisplayMode(id);
-            if current.is_null() {
-                return false;
-            }
-            let want = (CGDisplayModeGetWidth(current), CGDisplayModeGetHeight(current));
-            CGDisplayModeRelease(current);
-
-            let modes = CGDisplayCopyAllDisplayModes(id, std::ptr::null());
-            if modes.is_null() {
-                return false;
-            }
-            let mut found = false;
-            for i in 0..CFArrayGetCount(modes) {
-                let m = CFArrayGetValueAtIndex(modes, i);
-                if m.is_null() {
-                    continue;
-                }
-                let (w, h) = (CGDisplayModeGetWidth(m), CGDisplayModeGetHeight(m));
-                let one_to_one =
-                    CGDisplayModeGetPixelWidth(m) == w && CGDisplayModeGetPixelHeight(m) == h;
-                if one_to_one && (w, h) == want {
-                    found = true;
-                    break;
-                }
-            }
-            CFRelease(modes);
-            found
         }
     }
 }
@@ -862,42 +862,35 @@ mod tests {
         assert!(err.contains("colon"), "unexpected error: {err}");
     }
 
-    /// The crash this guards: asking for exclusive fullscreen on a display that
-    /// offers AC no 4:3 mode kills it with a DirectX dialog before it ever creates
-    /// a device, so such a display must get the virtual desktop instead.
     #[test]
-    fn the_display_decides_the_mode_unless_the_user_says_otherwise() {
-        let (yes, no) = (|| true, || false);
-
-        // The two machines this was measured on.
-        assert_eq!(LaunchMode::choose(false, false, false, yes), LaunchMode::Fullscreen);
-        assert_eq!(LaunchMode::choose(false, false, false, no), LaunchMode::Desktop);
+    fn the_default_is_a_space_and_explicit_intent_wins() {
+        // Spaces regardless of the display: it is windowed underneath, so unlike the
+        // old default it needs no exclusive adapter mode and cannot hit the
+        // built-in-panel DirectX failure that Desktop exists for.
+        assert_eq!(LaunchMode::choose(false, false, false), LaunchMode::Spaces);
 
         // Explicit intent wins, in priority order.
-        assert_eq!(LaunchMode::choose(true, false, false, yes), LaunchMode::Windowed);
-        assert_eq!(LaunchMode::choose(false, true, false, yes), LaunchMode::Desktop);
-        assert_eq!(LaunchMode::choose(false, false, true, no), LaunchMode::Fullscreen);
-        assert_eq!(LaunchMode::choose(true, true, true, no), LaunchMode::Windowed);
+        assert_eq!(LaunchMode::choose(true, false, false), LaunchMode::Windowed);
+        assert_eq!(LaunchMode::choose(false, true, false), LaunchMode::Desktop);
+        assert_eq!(LaunchMode::choose(false, false, true), LaunchMode::Fullscreen);
+        assert_eq!(LaunchMode::choose(true, true, true), LaunchMode::Windowed);
 
-        // AC must be told "fullscreen" inside a virtual desktop -- writing False
-        // there is what the pre-2026-07-21 code did, and it wastes the desktop.
+        // Spaces is windowed (False) so macOS will give it a Space; AC must be told
+        // "fullscreen" inside a virtual desktop -- writing False there is what the
+        // pre-2026-07-21 code did, and it wastes the desktop.
+        assert!(!LaunchMode::Spaces.ac_fullscreen(), "Spaces must be windowed to get a Space");
         assert!(LaunchMode::Desktop.ac_fullscreen(), "regression: the whole point of Desktop");
         assert!(LaunchMode::Fullscreen.ac_fullscreen());
         assert!(!LaunchMode::Windowed.ac_fullscreen());
     }
 
-    /// Manual probe — asks the *actual* display whether fullscreen is available,
-    /// so the answer depends on what is plugged in and it cannot be a CI
-    /// assertion. Run it when a display misbehaves:
+    /// Manual probe — the answer depends on what is plugged in right now, so it
+    /// cannot be a CI assertion. Run it when a display misbehaves:
     /// `cargo test -p ac-core -- --ignored --nocapture display_reports`
     #[test]
     #[ignore = "depends on the monitors attached right now"]
-    fn display_reports_whether_fullscreen_is_available() {
-        println!(
-            "main display {:?}, exclusive fullscreen available: {}",
-            display::main_resolution(),
-            display::exclusive_fullscreen_available()
-        );
+    fn display_reports_the_resolution_ac_will_be_pinned_to() {
+        println!("main display {:?}", display::main_resolution());
     }
 
     #[test]
