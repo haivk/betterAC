@@ -69,11 +69,29 @@ struct Entry: Codable, Identifiable, Hashable {
     }
 }
 
+/// Decal, the plugin framework. Mirrors `config::DecalConfig`.
+///
+/// Only the master switch lives here. Which *plugins* are on is kept in the Wine
+/// prefix's registry, because that is what Decal itself reads — see `decalPlugins`.
+struct DecalConfig: Codable {
+    var enabled: Bool = false
+}
+
+/// One plugin Decal knows about. Mirrors `decal::DecalPlugin`.
+struct DecalPlugin: Codable, Identifiable {
+    let clsid: String
+    let name: String
+    var enabled: Bool
+
+    var id: String { clsid }
+}
+
 /// Persisted state. Mirrors `config::Config`.
 struct Config: Codable {
     var prefix: String = ""
     var servers: [Entry] = []
     var last: String?
+    var decal: DecalConfig = DecalConfig()
 
     func entry(id: String) -> Entry? { servers.first { $0.id == id } }
 

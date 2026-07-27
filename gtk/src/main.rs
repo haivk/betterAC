@@ -38,7 +38,19 @@ fn main() -> gtk::glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(window::build);
-    app.run()
+    let code = app.run();
+
+    // End the Wine session if this run left anything in it. Opening Decal's
+    // settings deliberately leaves its agent running so the dialog stays
+    // reachable, and its tray icon is owned by the prefix's explorer.exe rather
+    // than by the agent -- so quitting without ending the session strands an icon
+    // nothing later clears. A no-op for anyone who never opened those settings,
+    // and specifically not something that fires while the game is running; see
+    // `runtime::shutdown_on_quit`.
+    if let Ok(install) = ac_core::runtime::discover() {
+        ac_core::runtime::shutdown_on_quit(&install);
+    }
+    code
 }
 
 /// Run the whole setup sequence to stdout and return a process exit code.
@@ -46,7 +58,7 @@ fn run_setup_headless() -> i32 {
     use ac_core::setup::{Progress, SetupStep, StepState};
 
     let cfg = ac_core::config::Config::load();
-    let rt = ac_core::proton::ProtonRuntime::new(cfg.prefix.clone());
+    let rt = ac_core::runtime::for_prefix(cfg.prefix.clone());
 
     let steps = SetupStep::ALL.len();
     let mut last_step: Option<SetupStep> = None;

@@ -8,10 +8,15 @@
 //! written and tested once.
 //!
 //! The one deliberate exception is display-resolution detection: it needs a
-//! toolkit, so the frontend detects it and passes it in (see `proton::launch`).
+//! toolkit, so the frontend detects it and passes it in (see `runtime::launch`).
+//!
+//! Which of the two Windows runtimes a build uses is decided once, in `runtime` —
+//! frontends go through that rather than naming `wine` or `proton` themselves.
 
 pub mod args;
+pub mod clrmeta;
 pub mod config;
+pub mod decal;
 pub mod fetch;
 pub mod gamefiles;
 pub mod install;
@@ -19,6 +24,7 @@ pub mod patches;
 pub mod prefs;
 pub mod proton;
 pub mod reset;
+pub mod runtime;
 pub mod servers;
 pub mod setup;
 
@@ -28,4 +34,4 @@ pub mod setup;
 #[cfg(target_os = "macos")]
 pub mod wine;
 
-pub use install::{default_prefix, steam_compat, Install};
+pub use install::{default_prefix, runtime_dir, steam_compat, support_dir, Install};

@@ -93,7 +93,73 @@ char *ac_reset_targets_json(void);
 //
 // Refused while a setup run is in flight — deleting the prefix out from under
 // the thread building it would leave a mess neither side could describe.
+//
+// A *running* prefix is different: that one we end ourselves first. Decal's agent
+// is left alive on purpose once opened (see [`ac_decal_open_settings`]), and
+// deleting the prefix from under a live wineserver strands its menu-bar icon with
+// nothing left on disk to explain it.
 char *ac_reset(void);
+
+// Is Decal provisioned in the prefix? `"1"` or `"0"`, so the UI can tell "off"
+// from "on but not installed yet" and prompt to re-run setup.
+char *ac_decal_installed(void);
+
+// The registered plugins, as a JSON array of `{"clsid","name","enabled"}`.
+// Empty when Decal is not installed — not an error, just nothing to show.
+char *ac_decal_plugins_json(void);
+
+// Turn one plugin on or off. Null on success, else an error string.
+//
+// # Safety
+// `clsid` must be a valid NUL-terminated C string.
+char *ac_decal_set_plugin(const char *clsid, bool enabled);
+
+// Register a plugin from a DLL on disk, disabled. Returns null on success, else
+// an error string.
+//
+// # Safety
+// `path` must be a valid NUL-terminated C string.
+char *ac_decal_add_plugin(const char *path);
+
+// Open Decal's own configuration UI (`DenAgent.exe`). Null on success, else an
+// error string.
+//
+// The agent has **no window**: it puts an icon in the menu bar and shows its
+// dialog when that is clicked. So this returns as soon as the process is spawned,
+// and the UI has to say where to look. It also stakes out no opinion about an
+// agent that is already running — Decal's own single-instance handling does, and
+// a second launch just surfaces the first.
+char *ac_decal_open_settings(void);
+
+// Install a Decal plugin from a `.zip`, `.msi` or `.exe` on the host filesystem.
+// Null on success, else an error string.
+//
+// A zip is the best thing to pass: it is unpacked into the prefix whole and the
+// installer inside is run, so nothing has to be guessed about which neighbouring
+// files that installer needs.
+//
+// **Blocks until the installer is done**, which includes however long the user
+// spends in its dialogs — the package gets its own UI, since a third-party
+// installer may have questions only the user can answer. Call it off the UI
+// thread.
+//
+// # Safety
+// `path` must be a valid NUL-terminated C string.
+char *ac_decal_install_plugin(const char *path);
+
+// Shut down everything still running in the prefix. Call when the app quits.
+//
+// End the Wine session at quit, if this run of the app left anything in it.
+//
+// Decal's agent outlives the settings sheet by design, and its status icon is
+// owned by the prefix's `explorer.exe`, not by the agent — so leaving the session
+// up leaks an icon nothing else will clear. Silent: at quit there is nobody left
+// to report a failure to, and the usual case is nothing to kill.
+//
+// Killing the session ends the **game** too, so this is a no-op unless the agent
+// was actually started — see `ac_core::runtime::shutdown_on_quit`. It used to be
+// unconditional, which meant quitting the launcher mid-session killed the game.
+void ac_decal_shutdown(void);
 
 // Free a string returned by any of the `*_json` / `*_get` / `ac_detect` /
 // `ac_setup_poll` / `ac_config_set` / `ac_launch` calls. Null is ignored. Never

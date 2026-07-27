@@ -4,10 +4,9 @@
 //! Safe to re-run: `patches::apply_all` is idempotent, so a second pass must report
 //! every patch as `already applied`.
 use ac_core::setup::{Runtime, SetupStep};
-use ac_core::wine::WineRuntime;
 
 fn main() {
-    let rt = WineRuntime::new(ac_core::install::default_prefix());
+    let rt = ac_core::runtime::for_prefix(ac_core::install::default_prefix());
     rt.run_step(SetupStep::PatchClient, &mut |p| println!("  {}", p.message))
         .expect("patch step");
 

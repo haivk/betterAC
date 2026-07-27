@@ -128,12 +128,11 @@ pub(crate) fn find_in_dir(dir: &Path, prefixes: &[&str], ext: &str) -> Option<Pa
 /// Fail unless the file's SHA-256 matches `expected_hex` (case-insensitive).
 /// Streams the file so a multi-hundred-MB download isn't slurped into memory.
 ///
-/// Only the macOS side has anything to check against: its Wine engine is a
-/// specific pinned release, so the hash is baked in next to the URL. Linux
-/// discovers the newest GE-Proton from the GitHub API at run time, so there is no
-/// hash known ahead of time to compare to — hence dead code there rather than a
-/// check we quietly skip.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Used wherever the thing being fetched is a *pinned* release: macOS's Wine
+/// engine, and every download [`crate::decal`] makes (the MSI, the DirectX
+/// redistributable, the VC++ 2005 runtime) on both platforms. The one download
+/// with no hash is Linux's GE-Proton, which is discovered from the GitHub API at
+/// run time — there is nothing known ahead of time to compare it to.
 pub(crate) fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;

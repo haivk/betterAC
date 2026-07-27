@@ -2,11 +2,8 @@
 
 use crate::launcher::{self, Install};
 use ac_core::config::Config;
-use ac_core::proton::ProtonRuntime;
 use ac_core::servers::{self, Server};
-// `Runtime` is in scope for its `discover`, which finish_setup calls on the
-// ProtonRuntime once setup succeeds.
-use ac_core::setup::{self, Progress, RunState, Runtime, SetupStep, StepState, StepStatus};
+use ac_core::setup::{self, Progress, RunState, SetupStep, StepState, StepStatus};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::cell::RefCell;
@@ -137,6 +134,12 @@ fn update_row(row: &SetupRow, status: &StepStatus, queue: bool) {
     } else {
         row.message.remove_css_class("error");
     }
+}
+
+/// A plain informational row -- no switch, nothing to press. Used where a list is
+/// empty, still loading, or unavailable.
+fn note_row(title: &str, subtitle: &str) -> adw::ActionRow {
+    adw::ActionRow::builder().title(title).subtitle(subtitle).build()
 }
 
 /// Redraw the whole list. Used at the terminal points, where several rows change
@@ -338,8 +341,16 @@ pub fn build(app: &adw::Application) {
     setup_buttons.set_halign(gtk::Align::Center);
     setup_buttons.append(&setup_btn);
     setup_buttons.append(&setup_cancel);
+    // The one choice setup asks for up front: whether to install Decal. It has to
+    // be here, not in settings, because settings is unreachable until setup is
+    // done. Defaults to what was chosen last so a resumed run keeps the answer.
+    let decal_check =
+        gtk::CheckButton::with_label("Install Decal — an optional third-party plugin framework");
+    decal_check.set_halign(gtk::Align::Center);
+    decal_check.set_active(cfg.decal.enabled);
     let setup_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     setup_box.append(&setup_buttons);
+    setup_box.append(&decal_check);
     setup_box.append(&setup_list);
     setup_box.append(&setup_error);
     let setup_inner = adw::StatusPage::builder()
@@ -434,20 +445,31 @@ pub fn build(app: &adw::Application) {
         let error = setup_error.clone();
         let btn = setup_btn.clone();
         let cancel = setup_cancel.clone();
+        let decal = decal_check.clone();
         setup_btn.connect_clicked(move |_| {
             btn.set_visible(false);
             cancel.set_label("Cancel");
             cancel.set_sensitive(true);
             cancel.set_visible(true);
+            decal.set_sensitive(false);
             error.set_visible(false);
             setup::clear_cancel();
+
+            // Persist the Decal choice before the run reads it: the InstallDecal
+            // step installs Decal iff this is set. Only chance a first-time user
+            // gets to decide, since settings opens only after setup completes.
+            {
+                let mut cfg = ui.cfg.borrow_mut();
+                cfg.decal.enabled = decal.is_active();
+                let _ = cfg.save();
+            }
 
             let prefix = ui.cfg.borrow().prefix.clone();
             let (tx, rx) = async_channel::unbounded::<SetupEvent>();
 
             // The work: shells out to umu-run/winetricks, downloads, unzips.
             gio::spawn_blocking(move || {
-                let rt = ProtonRuntime::new(prefix);
+                let rt = ac_core::runtime::for_prefix(prefix);
                 let mut on = |p: Progress| {
                     let _ = tx.send_blocking(SetupEvent::Progress(p));
                 };
@@ -621,7 +643,7 @@ impl App {
     /// setup whose every step now skips off its stamp.
     fn finish_setup(self: &Rc<Self>) {
         let prefix = self.cfg.borrow().prefix.clone();
-        *self.install.borrow_mut() = ProtonRuntime::new(prefix).discover();
+        *self.install.borrow_mut() = ac_core::runtime::discover_in(prefix);
         self.refresh_list();
 
         // If discovery somehow still failed, stay on setup rather than dropping
@@ -663,6 +685,8 @@ impl App {
         about.add(&version);
         page.add(&about);
 
+        self.clone().add_decal_groups(&page, &win);
+
         let group = adw::PreferencesGroup::builder()
             .title("Reset")
             .description(
@@ -697,6 +721,320 @@ impl App {
         btn.connect_clicked(move |_| ui.clone().confirm_reset(&parent));
     }
 
+    /// The Decal settings: a master switch and a row per registered plugin, then a
+    /// second group holding the two actions that reach outside the app — installing
+    /// a plugin, and opening Decal's own configuration UI.
+    ///
+    /// Only *manages* Decal — whether to install it is decided during setup, since
+    /// settings cannot be reached until setup finishes. So when Decal is not
+    /// installed this is just a note; there is no enable switch to press.
+    ///
+    /// Which plugins are on is read back from the prefix registry every time rather
+    /// than cached, because that is where Decal itself keeps it — this UI is a view
+    /// onto that, not a second copy of the truth. That is also why installing a
+    /// plugin re-reads the list rather than assuming what the installer registered.
+    ///
+    /// Two groups rather than one so the plugin rows can be torn down and rebuilt
+    /// after an install without the buttons drifting to the middle of the list:
+    /// `adw::PreferencesGroup` appends, so anything added after a refresh would land
+    /// below whatever was there before.
+    fn add_decal_groups(self: Rc<Self>, page: &adw::PreferencesPage, parent: &adw::PreferencesWindow) {
+        let group = adw::PreferencesGroup::builder()
+            .title("Decal")
+            .description(
+                "A third-party plugin framework for Asheron's Call. Plugins stay off \
+                 until you switch them on.",
+            )
+            .build();
+        page.add(&group);
+
+        let config = ac_core::config::Config::load();
+        if !ac_core::decal::is_installed(&config.prefix) {
+            let note = adw::ActionRow::builder()
+                .title("Not installed")
+                .subtitle("Reset and set up again to add Decal.")
+                .build();
+            group.add(&note);
+            return;
+        }
+
+        let toggle = adw::ActionRow::builder().title("Enable Decal").build();
+        let switch = gtk::Switch::builder()
+            .active(config.decal.enabled)
+            .valign(gtk::Align::Center)
+            .build();
+        toggle.add_suffix(&switch);
+        toggle.set_activatable_widget(Some(&switch));
+        group.add(&toggle);
+
+        let ui = self.clone();
+        switch.connect_state_set(move |_, on| {
+            // Re-read rather than capture: settings can be open while other parts
+            // of the app write config, and this must not clobber their changes.
+            let mut cfg = ac_core::config::Config::load();
+            cfg.decal.enabled = on;
+            if let Err(e) = cfg.save() {
+                ui.toast(&format!("Could not save settings: {e}"));
+            }
+            gtk::glib::Propagation::Proceed
+        });
+
+        // The plugin rows are rebuilt in place -- when the list first loads, and
+        // again after an install -- so they are tracked rather than added and
+        // forgotten: a PreferencesGroup can only remove a child it is handed.
+        let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+        let refresh: Rc<dyn Fn()> = {
+            let (group, rows, ui) = (group.clone(), rows.clone(), self.clone());
+            Rc::new(move || ui.clone().reload_plugin_rows(&group, &rows))
+        };
+        refresh();
+
+        let actions = adw::PreferencesGroup::new();
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::Center);
+        let install_btn = gtk::Button::with_label("Install Plugin…");
+        install_btn.add_css_class("pill");
+        let agent_btn = gtk::Button::with_label("Open Decal Settings…");
+        agent_btn.add_css_class("pill");
+        buttons.append(&install_btn);
+        buttons.append(&agent_btn);
+        actions.add(&buttons);
+        page.add(&actions);
+
+        let ui = self.clone();
+        let parent = parent.clone();
+        let refresh_after = refresh.clone();
+        install_btn.connect_clicked(move |btn| {
+            ui.clone().choose_and_install_plugin(&parent, btn.clone(), refresh_after.clone());
+        });
+
+        let ui = self.clone();
+        agent_btn.connect_clicked(move |_| {
+            // Deliberately left running when this window closes, so Decal's dialog
+            // stays reachable; the prefix is killed when betterAC quits, which is
+            // also what clears any tray icon it left behind.
+            // The cached install again, not a fresh `discover` -- that walks the
+            // whole prefix. `open_settings` only spawns, so it does not block.
+            let r = match ui.install.borrow().as_ref().ok().cloned() {
+                Some(install) => ac_core::decal::open_settings(&install.prefix, &|args| {
+                    ac_core::runtime::spawn_in_prefix(&install, args)
+                }),
+                None => Err("The install could not be found.".into()),
+            };
+            match r {
+                Ok(()) => ui.toast(
+                    "Decal's agent has no window — use its tray icon to configure plugins.",
+                ),
+                Err(e) => ui.toast(&e),
+            }
+        });
+    }
+
+    /// Fill the Decal group's plugin rows from the prefix registry, **off the main
+    /// thread**, showing a spinner row until the answer arrives.
+    ///
+    /// Reading which plugins are on means asking wineserver, and that is not a
+    /// cheap call: it spawns `umu-run`, which starts a pressure-vessel container.
+    /// Cold, that is seconds. Done inline it blocked the settings window from being
+    /// presented *at all* — the window was built, then the query ran, then
+    /// `present()` — so opening Settings looked like the app had hung, which is
+    /// exactly what happened when reaching for the Reset button. The macOS panel
+    /// solved this the same way (`SettingsView.refreshDecal`); this is the GTK half.
+    ///
+    /// Everything else in Settings — About, the Decal switch, Reset and its target
+    /// list — is microseconds and stays synchronous, so the window is complete and
+    /// usable the moment it appears. Only this one list arrives late.
+    ///
+    /// The install is taken from the app's cached `install` rather than rediscovered:
+    /// `discover` walks the prefix looking for `acclient.exe`, and the prefix is
+    /// gigabytes.
+    fn reload_plugin_rows(
+        self: Rc<Self>,
+        group: &adw::PreferencesGroup,
+        rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    ) {
+        let replace = |rows: &Rc<RefCell<Vec<adw::ActionRow>>>, new: Vec<adw::ActionRow>| {
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            for row in &new {
+                group.add(row);
+            }
+            *rows.borrow_mut() = new;
+        };
+
+        let loading = adw::ActionRow::builder()
+            .title("Reading Decal's state from the prefix…")
+            .build();
+        let spinner = gtk::Spinner::new();
+        spinner.start();
+        loading.add_suffix(&spinner);
+        replace(rows, vec![loading]);
+
+        // Cloned out of the RefCell so nothing borrowed crosses the await below.
+        let Some(install) = self.install.borrow().as_ref().ok().cloned() else {
+            replace(rows, vec![note_row("Plugins unavailable", "The install could not be found.")]);
+            return;
+        };
+        let prefix = ac_core::config::Config::load().prefix;
+
+        let (tx, rx) = async_channel::bounded(1);
+        gio::spawn_blocking(move || {
+            let plugins = ac_core::decal::plugins(&prefix, &|args| {
+                ac_core::runtime::query_in_prefix(&install, args)
+            });
+            let _ = tx.send_blocking(plugins);
+        });
+
+        let (group, rows, ui) = (group.clone(), rows.clone(), self.clone());
+        glib::spawn_future_local(async move {
+            let Ok(plugins) = rx.recv().await else { return };
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            if plugins.is_empty() {
+                let none = note_row("No plugins are registered", "Use Install Plugin… to add one.");
+                group.add(&none);
+                rows.borrow_mut().push(none);
+                return;
+            }
+            for plugin in plugins {
+                let row = adw::ActionRow::builder()
+                    .title(if plugin.name.is_empty() { &plugin.clsid } else { &plugin.name })
+                    .subtitle(&plugin.clsid)
+                    .build();
+                let sw = gtk::Switch::builder()
+                    .active(plugin.enabled)
+                    .valign(gtk::Align::Center)
+                    .build();
+                row.add_suffix(&sw);
+                row.set_activatable_widget(Some(&sw));
+                group.add(&row);
+                rows.borrow_mut().push(row);
+
+                let ui = ui.clone();
+                let clsid = plugin.clsid.clone();
+                sw.connect_state_set(move |sw, on| {
+                    ui.clone().set_decal_plugin(sw.clone(), &clsid, on);
+                    gtk::glib::Propagation::Proceed
+                });
+            }
+        });
+    }
+
+    /// Pick a plugin off disk and install it.
+    ///
+    /// Two paths, matching what plugins actually ship as: an `.msi`/`.exe`/`.zip`
+    /// runs the author's own installer (the only thing that reliably registers a
+    /// plugin the way it intended), while a bare `.dll` is registered from its own
+    /// .NET metadata — no installer, and no .NET needed to do it. The DLL route is
+    /// the fallback, and it lands the plugin switched off, which is Decal's
+    /// convention rather than a failure.
+    ///
+    /// The installer draws its own windows and blocks until the user has finished
+    /// with them, so it runs off the main thread or the whole UI would freeze
+    /// behind it. The button is disabled meanwhile: two installers at once in one
+    /// prefix is nobody's idea of a good time.
+    fn choose_and_install_plugin(
+        self: Rc<Self>,
+        parent: &adw::PreferencesWindow,
+        btn: gtk::Button,
+        refresh: Rc<dyn Fn()>,
+    ) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Decal plugins and installers"));
+        for pattern in ["*.zip", "*.msi", "*.exe", "*.dll"] {
+            filter.add_pattern(pattern);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose a Decal plugin")
+            .filters(&filters)
+            .modal(true)
+            .build();
+
+        let ui = self.clone();
+        dialog.open(Some(parent), gtk::gio::Cancellable::NONE, move |result| {
+            let Some(path) = result.ok().and_then(|f| f.path()) else { return };
+            let is_dll =
+                path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll"));
+
+            btn.set_sensitive(false);
+            let (tx, rx) = async_channel::unbounded::<Result<(), String>>();
+            let job = path.clone();
+            gio::spawn_blocking(move || {
+                let r = ac_core::runtime::discover().and_then(|install| {
+                    let run = |args: &[&str]| ac_core::runtime::run_in_prefix(&install, args);
+                    if is_dll {
+                        ac_core::decal::add_plugin_from_dll(&install.prefix, &job, &run).map(|_| ())
+                    } else {
+                        ac_core::decal::install_plugin(&install.prefix, &job, &run)
+                    }
+                });
+                let _ = tx.send_blocking(r);
+            });
+
+            glib::spawn_future_local(async move {
+                if let Ok(result) = rx.recv().await {
+                    btn.set_sensitive(true);
+                    match result {
+                        // A DLL is registered switched off by Decal's own
+                        // convention -- say so, or it reads as a silent failure.
+                        Ok(()) if is_dll => ui.toast(
+                            "Registered, switched off. Turn it on in the list above.",
+                        ),
+                        Ok(()) => ui.toast("Plugin installed."),
+                        Err(e) => ui.toast(&e),
+                    }
+                    refresh();
+                }
+            });
+        });
+    }
+
+    /// Flip one plugin's `Enabled` value in the prefix registry.
+    /// Flip one plugin's `Enabled` value in the prefix registry, off the main
+    /// thread.
+    ///
+    /// Writing it means a `reg import` through `umu-run`, which costs the same
+    /// container start as reading does -- so doing it inline froze the whole window
+    /// for as long as the write took, on a click whose visible result (the switch
+    /// moving) has already happened. The switch is disabled until the write lands
+    /// so two flips cannot race each other into the same registry.
+    ///
+    /// A failure is reported and the switch left where the user put it, rather than
+    /// snapped back: `set_active` would re-enter this handler, and the honest state
+    /// is "we tried and could not", which the toast says.
+    fn set_decal_plugin(self: Rc<Self>, sw: gtk::Switch, clsid: &str, enabled: bool) {
+        let Some(install) = self.install.borrow().as_ref().ok().cloned() else {
+            self.toast("The install could not be found.");
+            return;
+        };
+        let prefix = ac_core::config::Config::load().prefix;
+        let clsid = clsid.to_string();
+
+        sw.set_sensitive(false);
+        let (tx, rx) = async_channel::bounded(1);
+        gio::spawn_blocking(move || {
+            let r = ac_core::decal::set_plugin_enabled(&prefix, &clsid, enabled, &|args| {
+                ac_core::runtime::run_in_prefix(&install, args)
+            });
+            let _ = tx.send_blocking(r);
+        });
+
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(r) = rx.recv().await {
+                sw.set_sensitive(true);
+                if let Err(e) = r {
+                    ui.toast(&e);
+                }
+            }
+        });
+    }
+
     /// Second gate on an irreversible action: the button opens this, this does it.
     fn confirm_reset(self: Rc<Self>, parent: &adw::PreferencesWindow) {
         let dialog = adw::MessageDialog::new(
@@ -729,21 +1067,78 @@ impl App {
     ///
     /// This is the mirror of `finish_setup`: that one re-discovers and moves to
     /// the launcher, this one un-discovers and moves to setup.
+    /// Tear the install down, then put the UI back to "setup has never run".
+    ///
+    /// The deleting half runs **off the main thread**: it ends the Wine session and
+    /// then removes the prefix, the Proton runtime and the settings -- several
+    /// gigabytes, seconds of work -- and doing that inline froze the window with no
+    /// sign it was doing anything. The setup screen is shown immediately with the
+    /// button reading "Removing…" so the wait is visible and nothing can be pressed
+    /// twice. The macOS panel does the same (`SettingsView.performReset`).
     fn do_reset(self: Rc<Self>) {
-        if let Err(e) = ac_core::reset::reset() {
-            self.toast(&e);
-            return;
-        }
+        self.setup_error.set_visible(false);
+        self.setup_btn.set_label("Removing…");
+        self.setup_btn.set_sensitive(false);
+        self.setup_btn.set_visible(true);
+        self.stack.set_visible_child_name("setup");
 
+        // Resolved here, on the main thread, but only to hand to the worker: the
+        // cached install is what the shutdown needs and re-discovering would walk
+        // the prefix we are about to delete.
+        let install = self.install.borrow().as_ref().ok().cloned();
+        let (tx, rx) = async_channel::bounded(1);
+        gio::spawn_blocking(move || {
+            // End the session before deleting what it is running out of.
+            // Unconditional, unlike the teardown at quit: the prefix is about to go,
+            // so anything still in it has to go too. Without this, wineserver
+            // flushes its registry and recreates `dosdevices` entries *while* the
+            // tree is being removed, and the delete empties the prefix and then
+            // fails on the directory itself. `reset::remove_dir_all_settling`
+            // retries around that, but retrying is the backstop -- this is the fix.
+            // (The macOS frontend has always done it; see `ac_reset` in the FFI.)
+            if let Some(install) = install {
+                ac_core::runtime::shutdown_prefix(&install);
+            }
+            let _ = tx.send_blocking(ac_core::reset::reset().map(|_| ()));
+        });
+
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else { return };
+            ui.setup_btn.set_sensitive(true);
+            if let Err(e) = result {
+                ui.setup_btn.set_label("Set up Asheron's Call");
+                ui.toast(&e);
+                return;
+            }
+            ui.finish_reset();
+        });
+    }
+
+    /// The main-thread half of [`do_reset`]: everything that touches widgets or the
+    /// app's own state, once the deleting is done.
+    fn finish_reset(self: Rc<Self>) {
         // The config file is gone, so this reloads defaults -- which puts `prefix`
         // back to the path a fresh setup would build.
         *self.cfg.borrow_mut() = Config::load();
         let prefix = self.cfg.borrow().prefix.clone();
-        *self.install.borrow_mut() = ProtonRuntime::new(prefix).discover();
+        *self.install.borrow_mut() = ac_core::runtime::discover_in(prefix);
 
         // Drop the launcher's per-server state before the saved list changes under
         // it: this clears the credential fields and the detail pane.
-        self.select(None);
+        //
+        // Under `Suppress`, and that is load-bearing rather than tidy. `select`
+        // flushes the credential fields before reusing them, and at this instant
+        // `selected` still names the server that was showing while the entries still
+        // hold its account and password -- so the flush would see "not saved, but
+        // something typed", re-add the server to the freshly defaulted config, write
+        // the password into it and save. That recreated `config.json`, complete with
+        // the password, moments after the reset deleted it: the confirmation dialog
+        // promises the saved servers and passwords are gone, and they were not.
+        {
+            let _guard = Suppress::new(&self);
+            self.select(None);
+        }
         self.refresh_list();
         self.play.set_sensitive(false);
 

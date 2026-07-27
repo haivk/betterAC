@@ -1,8 +1,19 @@
 //! Running acclient.exe under Proton on Linux.
 //!
-//! The client always goes through umu-run. Proton's bin/wine cannot be invoked
-//! directly: it is a new-WoW64 build with no 32-bit GL outside the Steam runtime
-//! container, and acclient.exe dies instantly.
+//! The client always goes through umu-run. Proton's bin/wine cannot run *it*
+//! directly: outside the Steam runtime container there is no 32-bit GL, and
+//! acclient.exe dies instantly. Everything else Windows-side goes through umu-run
+//! too, for the same prefix and the same environment.
+//!
+//! The one exception is deliberate and narrow: provisioning Decal drives
+//! winetricks, which wants a `WINE`/`WINESERVER` pair it can run itself, and
+//! Microsoft's .NET installer touches no GL at all. `files/bin/wine` is a genuine
+//! 32-bit ELF (the classic multilib build) and handles that fine — verified
+//! installing real .NET 4.8 into a prefix on Bazzite. See [`wine_bin`].
+//!
+//! betterAC runs a GE-Proton build it **owns**, copied out of Steam's
+//! `compatibilitytools.d` rather than run from it — see
+//! [`crate::install::runtime_dir`] for why that matters.
 //!
 //! Display-resolution detection is NOT here -- it needs a toolkit (Mutter over
 //! D-Bus, or GDK) and so lives in the GTK frontend, which passes the result in.
@@ -11,7 +22,9 @@
 use crate::args::{gamescope_args_for, invocation, validate};
 use crate::fetch::{download, extract_tar_gz, extract_zip, find_in_dir};
 use crate::gamefiles::GameSources;
-use crate::install::{find_acclient, find_game_dir, find_proton, steam_compat, Install};
+use crate::install::{
+    find_acclient, find_game_dir, find_proton, find_steam_proton, runtime_dir, Install,
+};
 use crate::patches;
 use crate::servers::Server;
 use crate::setup::{is_stamped, mark_stamped, Progress, Runtime, SetupStep};
@@ -70,8 +83,32 @@ pub fn launch(
         crate::prefs::apply(&install.ac_dir, &install.prefix, (w, h), true);
     }
 
+    // Keep the client's patches current. They ship with the app, not with the
+    // prefix, so an install set up by an older build would otherwise never see a
+    // patch added since -- the setup step that applies them does not run again once
+    // setup is complete. `apply_all` is idempotent and only writes when something
+    // actually changed, and a failure here is not worth refusing to launch over.
+    let _ = crate::patches::apply_all(&install.ac_dir.join("acclient.exe"));
+
     let gamescope = gamescope_enabled();
-    let inv = invocation(server, account, password, gamescope, &gamescope_args(resolution));
+    // Decal runs in front of the client and starts it itself. Only when it is both
+    // switched on and actually provisioned -- a missing install must not stop the
+    // game launching.
+    let injector = crate::decal::launch_injector(&install.prefix);
+    if injector.is_some() {
+        // See the matching calls in `wine::launch`: the plugins need both of these
+        // to render, and a prefix built before they existed only gets them here.
+        let _ = crate::decal::ensure_runtime_config(&install.ac_dir);
+        let _ = crate::decal::ensure_msil_assemblies(&install.prefix, &install.ac_dir);
+    }
+    let inv = invocation(
+        server,
+        account,
+        password,
+        gamescope,
+        &gamescope_args(resolution),
+        injector.as_deref(),
+    );
 
     let mut cmd = Command::new(&inv.program);
     cmd.args(&inv.args)
@@ -100,6 +137,101 @@ pub fn launch(
     })
 }
 
+/// Run a Windows program inside an installed prefix — the [`crate::decal`]
+/// operations the settings UI performs (importing a `.reg`, mostly) need one of
+/// these. Proton's own wine only works inside the Steam runtime container, so this
+/// goes through umu-run exactly like the client does.
+pub fn run_in_prefix(install: &Install, args: &[&str]) -> Result<(), String> {
+    let status = umu_cmd(install, args).status().map_err(|e| format!("umu-run: {e}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{} failed ({status})", args.first().unwrap_or(&"umu-run")))
+}
+
+/// Like [`run_in_prefix`], but returns as soon as the program is running rather
+/// than waiting for it to exit — for Windows programs that stay up, such as Decal's
+/// agent. See [`crate::wine::spawn_in_prefix`].
+pub fn spawn_in_prefix(install: &Install, args: &[&str]) -> Result<(), String> {
+    umu_cmd(install, args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("umu-run: {e}"))
+}
+
+/// End everything running in the prefix, so nothing outlives the app. The Proton
+/// counterpart of [`crate::wine::shutdown_prefix`].
+///
+/// **Runs the Proton build's `wineserver` directly, not through umu-run**, and
+/// that is the whole content of this function. `umu-run wineserver -k` reports
+/// success and kills nothing: umu runs it inside a pressure-vessel container, so
+/// the `wineserver` it signals is not the one holding the session. Measured on
+/// Bazzite with Decal's agent up — after `umu-run wineserver -k && umu-run
+/// wineserver -w`, both `rc=0`, the agent was still running; one direct
+/// `files/bin/wineserver -k` ended it.
+///
+/// Best-effort throughout: a prefix with nothing running is the normal case.
+pub fn shutdown_prefix(install: &Install) {
+    let server = wine_bin(&install.proton).with_file_name("wineserver");
+    if !server.is_file() {
+        return;
+    }
+    let run = |arg: &str| {
+        let _ = Command::new(&server)
+            .arg(arg)
+            .env("WINEPREFIX", &install.prefix)
+            .env("WINEDEBUG", "-all")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    };
+    run("-k");
+    // `-k` only asks; it returns before the server has gone. On its way out
+    // wineserver flushes the registry and rewrites `.update-timestamp`, so a reset
+    // that deletes the prefix immediately after would race files reappearing
+    // underneath it. `-w` waits, and returns at once when there is no server.
+    run("-w");
+}
+
+/// Like [`run_in_prefix`], but returns the program's stdout. Used for `reg query`.
+pub fn query_in_prefix(install: &Install, args: &[&str]) -> Result<String, String> {
+    let out = umu_cmd(install, args).output().map_err(|e| format!("umu-run: {e}"))?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .ok_or_else(|| format!("{} failed", args.first().unwrap_or(&"umu-run")))
+}
+
+/// A umu-run command for a **utility** program in the prefix — a `reg` query, an
+/// installer, `wineserver -k`. Not the client; that is built in [`launch`].
+///
+/// `PROTON_VERB=run` rather than the `waitforexitandrun` the client launch uses,
+/// and the difference is not cosmetic: `waitforexitandrun` does not return until
+/// the whole wine session has drained, so **one lingering background process hangs
+/// it forever**. Measured on Bazzite with Decal's agent up — `run` returned in
+/// 1.8 s, `waitforexitandrun` was still blocked at 45 s and would have stayed
+/// there.
+///
+/// A lingering process is the normal case here, not an edge one. Decal's MSI
+/// starts `DenAgent.exe` as its last act, and opening Decal's settings leaves that
+/// agent running on purpose. With the old verb the settings panel's plugin query
+/// would hang the moment the agent it just started was up — and so, circularly,
+/// would [`shutdown_prefix`], which exists precisely to kill it.
+fn umu_cmd(install: &Install, args: &[&str]) -> Command {
+    let mut c = Command::new("umu-run");
+    c.args(args)
+        .env("WINEPREFIX", &install.prefix)
+        .env("STEAM_COMPAT_DATA_PATH", &install.prefix)
+        .env("GAMEID", "umu-default")
+        .env("PROTONPATH", &install.proton)
+        .env("PROTON_VERB", "run")
+        .env("UMU_LOG", "warn")
+        .env("WINEDEBUG", "-all");
+    c
+}
+
 // ------------------------------------------------------------------------ setup
 //
 // A faithful port of install-ac.sh. Each SetupStep here does exactly what the
@@ -111,9 +243,17 @@ pub fn launch(
 
 const PROTON_SERIES: &str = "GE-Proton10";
 
-// VC++ 2005 SP1, from the Wayback Machine because the original Microsoft URL is
-// long dead. Matches the one install-ac.sh fetched.
-const VCREDIST_2005_URL: &str = "https://web.archive.org/web/20190419092632/https://download.microsoft.com/download/e/1/c/e1c773de-73ba-494a-a5ba-f24906ecf088/vcredist_x86.exe";
+/// Proton verbs, named so the call sites read as the decision they are making.
+///
+/// `WAIT` blocks until the whole wine session has drained; `RUN` blocks only on
+/// the program itself. Use `RUN` for anything that might leave something running
+/// -- see [`umu_cmd`] for what happens otherwise.
+const WAIT: &str = "waitforexitandrun";
+const RUN: &str = "run";
+
+// The VC++ 2005 SP1 URL that used to live here is gone with the Components step
+// that used it; `decal::VCRUN2005_URL` is the surviving copy, fetched only when
+// Decal's plugin installers actually need it.
 
 /// The Linux runtime: GE-Proton via umu-run, under gamescope. Owns the paths and
 /// sources setup needs; implements `Runtime` so the frontend drives it blind.
@@ -147,13 +287,20 @@ impl ProtonRuntime {
 
     /// A umu-run command carrying the same environment install-ac.sh set. Proton's
     /// bin/wine cannot be run directly; everything Windows-side goes through this.
-    fn umu(&self, proton: &Path, program: &str) -> Command {
+    ///
+    /// `verb` picks the Proton verb, and the choice matters — see [`umu_cmd`] for
+    /// the measurement. `waitforexitandrun` waits for the whole wine session to
+    /// drain, which is what prefix creation and the game installer want (they are
+    /// the only thing running, and we want the session settled before the next
+    /// step). Anything that may leave a background process behind must use `run`
+    /// instead, or it never returns.
+    fn umu(&self, proton: &Path, program: &str, verb: &str) -> Command {
         let mut c = Command::new(program);
         c.env("WINEPREFIX", &self.prefix)
             .env("STEAM_COMPAT_DATA_PATH", &self.prefix)
             .env("GAMEID", "umu-default")
             .env("PROTONPATH", proton)
-            .env("PROTON_VERB", "waitforexitandrun")
+            .env("PROTON_VERB", verb)
             .env("UMU_LOG", "warn")
             .env("WINEDEBUG", "-all");
         c
@@ -193,6 +340,15 @@ impl ProtonRuntime {
             on(Progress::skipped(SetupStep::DownloadRuntime, "GE-Proton is already installed"));
             return Ok(());
         }
+        // A build Steam has already downloaded is copied in by the install step,
+        // so there is nothing to fetch. Most Bazzite boxes land here.
+        if let Some(steam) = find_steam_proton() {
+            on(Progress::skipped(
+                SetupStep::DownloadRuntime,
+                format!("{} is already installed for Steam", name_of(&steam)),
+            ));
+            return Ok(());
+        }
         on(Progress::new(SetupStep::DownloadRuntime, 0.0, "finding the latest GE-Proton10…"));
         let url = latest_ge_proton_url()?;
         let name = url.rsplit('/').next().unwrap_or("ge-proton.tar.gz").to_string();
@@ -214,25 +370,58 @@ impl ProtonRuntime {
         self.games.fetch_updates(&self.cache, on).map(|_| ())
     }
 
+    /// Put a GE-Proton build in [`runtime_dir`], which is betterAC's and nobody
+    /// else's — copied from Steam's if there is one there, unpacked from the
+    /// download if not.
+    ///
+    /// Deliberately gated on the build **existing** rather than on the stamp,
+    /// unlike its neighbours. betterAC used to run straight out of Steam's
+    /// `compatibilitytools.d`; an install from that era is stamped but has nothing
+    /// here, and this is what migrates it. The copy is local and takes seconds.
+    ///
+    /// Why a private copy at all: provisioning Decal hot-patches three no-op
+    /// prologues into the runtime's builtin `d3d9`/`kernel32` (see
+    /// [`crate::decal`]), and a build Steam shares with every other game is not
+    /// ours to modify. Owning the copy also means a GE-Proton update cannot change
+    /// the runtime under a working install.
     fn step_install_runtime(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
-        if is_stamped(&self.prefix, SetupStep::InstallRuntime) || find_proton().is_some() {
+        if find_proton().is_some() {
             on(Progress::skipped(SetupStep::InstallRuntime, "already installed"));
             return Ok(());
         }
-        // The download step remembers what it fetched; a resumed run that skipped
-        // it falls back to whatever GE-Proton tarball is sitting in the cache,
-        // which is cheaper (and offline-safe) compared to asking GitHub again.
-        let tarball = self
-            .tarball
-            .get()
-            .cloned()
-            .or_else(|| find_in_dir(&self.cache, &["ge-proton"], "tar.gz"))
-            .ok_or("no GE-Proton tarball was downloaded")?;
-        on(Progress::new(SetupStep::InstallRuntime, 0.3, "unpacking GE-Proton…"));
-        let compat = steam_compat();
-        std::fs::create_dir_all(&compat).map_err(|e| e.to_string())?;
-        extract_tar_gz(&tarball, &compat)?;
-        find_proton().ok_or("GE-Proton unpacked but no usable build was found")?;
+        let dest = runtime_dir();
+        std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+        if let Some(steam) = find_steam_proton() {
+            let name = name_of(&steam);
+            on(Progress::new(
+                SetupStep::InstallRuntime,
+                0.3,
+                format!("copying {name} out of Steam's tools (Steam's copy is left alone)…"),
+            ));
+            // Into a temporary name first, then renamed: an interrupted copy must
+            // not leave a half-built GE-Proton that `find_proton` would then pick.
+            let staging = dest.join(format!(".{name}.partial"));
+            let _ = std::fs::remove_dir_all(&staging);
+            copy_tree(&steam, &staging)?;
+            std::fs::rename(&staging, dest.join(&name)).map_err(|e| e.to_string())?;
+        } else {
+            // The download step remembers what it fetched; a resumed run that
+            // skipped it falls back to whatever GE-Proton tarball is sitting in the
+            // cache, which is cheaper (and offline-safe) than asking GitHub again.
+            let tarball = self
+                .tarball
+                .get()
+                .cloned()
+                .or_else(|| find_in_dir(&self.cache, &["ge-proton"], "tar.gz"))
+                .ok_or("no GE-Proton tarball was downloaded")?;
+            on(Progress::new(SetupStep::InstallRuntime, 0.3, "unpacking GE-Proton…"));
+            extract_tar_gz(&tarball, &dest)?;
+        }
+
+        find_proton().ok_or_else(|| {
+            format!("GE-Proton was installed but no usable build was found in {}", dest.display())
+        })?;
         mark_stamped(&self.prefix, SetupStep::InstallRuntime).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -246,9 +435,9 @@ impl ProtonRuntime {
         std::fs::create_dir_all(&self.prefix).map_err(|e| e.to_string())?;
         on(Progress::new(SetupStep::Prefix, 0.2, "initialising win64 prefix (first run is slow)…"));
         // wineboot first; fall back to cmd /c exit, exactly as the script did.
-        let _ = self.umu(&proton, "umu-run").args(["wineboot", "--init"]).status();
+        let _ = self.umu(&proton, "umu-run", WAIT).args(["wineboot", "--init"]).status();
         if !self.prefix.join("drive_c").is_dir() {
-            let _ = self.umu(&proton, "umu-run").args(["cmd", "/c", "exit"]).status();
+            let _ = self.umu(&proton, "umu-run", WAIT).args(["cmd", "/c", "exit"]).status();
         }
         if !self.prefix.join("drive_c").is_dir() {
             return Err(format!(
@@ -260,25 +449,37 @@ impl ProtonRuntime {
         Ok(())
     }
 
+    /// Deliberately empty, exactly like the macOS counterpart.
+    ///
+    /// This used to run `winetricks -q vcrun2019` (slow — Microsoft's installer
+    /// under Wine) and then install VC++ 2005 SP1, both inherited from
+    /// install-ac.sh. **The client needs neither**, and that is measured rather
+    /// than assumed: the import tables of every `.exe` and `.dll` in the installed
+    /// game directory name only `msvcr70`/`msvcp70`/`msvci70`,
+    /// `msvcr71`/`msvcp71`, `msvcrt` and `kernel32` — and every one of those
+    /// C runtimes **ships inside the game directory itself**, delivered by
+    /// `ac-updates.zip`. Nothing anywhere imports `vcruntime140`/`msvcp140`
+    /// (vcrun2019) or `msvcr80`/`msvcp80` (VC++ 2005). macOS has run without them
+    /// since Step Zero, on the same client, which is the corroborating half.
+    ///
+    /// VC++ 2005 is still installed where it is genuinely required — by
+    /// [`crate::decal::ensure_vcrun2005`], because Decal's *plugin installers*
+    /// call `MsiQueryProductState` for it. That is a Decal prerequisite, not a
+    /// client one, and it now lives with the rest of Decal's provisioning on both
+    /// platforms instead of being paid for by every Linux install.
+    ///
+    /// Kept as a step (and stamped) so both platforms walk the same sequence and
+    /// the setup UI matches. Installs stamped by an older build are unaffected —
+    /// they already have the components, and nothing removes them.
     fn step_components(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
         if is_stamped(&self.prefix, SetupStep::Components) {
             on(Progress::skipped(SetupStep::Components, "already installed"));
             return Ok(());
         }
-        let proton = find_proton().ok_or("no GE-Proton available")?;
-        // Non-zero exit from winetricks is common and usually still installs; the
-        // script tolerated it and so do we.
-        on(Progress::new(SetupStep::Components, 0.1, "winetricks vcrun2019 (slow, be patient)…"));
-        let _ = self.umu(&proton, "umu-run").args(["winetricks", "-q", "vcrun2019"]).status();
-
-        on(Progress::new(SetupStep::Components, 0.7, "VC++ 2005 SP1…"));
-        std::fs::create_dir_all(&self.cache).map_err(|e| e.to_string())?;
-        let vc = self.cache.join("vcredist_x86.exe");
-        if !vc.exists() {
-            download(VCREDIST_2005_URL, &vc, SetupStep::Components, on)?;
-        }
-        let _ = self.umu(&proton, "umu-run").arg(&vc).arg("/Q").status();
-
+        on(Progress::skipped(
+            SetupStep::Components,
+            "not needed — the client's C runtimes ship with the game files",
+        ));
         mark_stamped(&self.prefix, SetupStep::Components).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -296,7 +497,7 @@ impl ProtonRuntime {
             "the Asheron's Call installer is open — click through it and accept the default path",
         ));
         // The real wizard. Non-zero is tolerated; we verify by the data file.
-        let _ = self.umu(&proton, "umu-run").arg(&installer).status();
+        let _ = self.umu(&proton, "umu-run", WAIT).arg(&installer).status();
         find_game_dir(&self.prefix)
             .ok_or("no client_portal.dat found under the prefix -- did the install finish?")?;
         mark_stamped(&self.prefix, SetupStep::InstallClient).map_err(|e| e.to_string())?;
@@ -361,6 +562,40 @@ impl ProtonRuntime {
         Ok(())
     }
 
+    /// Provision Decal, but only if the user opted in on the setup screen. Off is
+    /// the default, so for most installs this downloads nothing and does nothing.
+    ///
+    /// Deliberately stampless (see [`SetupStep::stamp`]): the opt-in is read from
+    /// config, and a resumed run must re-evaluate it rather than remember an earlier
+    /// "no".
+    fn step_install_decal(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
+        if !crate::config::Config::load().decal.enabled {
+            on(Progress::skipped(SetupStep::InstallDecal, "Decal was not selected"));
+            return Ok(());
+        }
+        let proton = find_proton().ok_or("no GE-Proton available to install Decal")?;
+        if crate::decal::is_installed(&self.prefix) {
+            // Re-apply the parts that live outside the Decal directory -- the
+            // injector and cohook ship with the app, and the runtime hot-patch lives
+            // in the Proton build, so it is lost whenever that build is replaced.
+            crate::decal::ensure_runtime_hooks(&self.prefix, &wine_bin(&proton))?;
+            on(Progress::skipped(SetupStep::InstallDecal, "Decal is already installed"));
+            return Ok(());
+        }
+        let game_dir = find_game_dir(&self.prefix).ok_or("game directory not found for Decal")?;
+        // Everything Windows-side still goes through umu-run, exactly as the client
+        // does -- `decal::install` only ever reaches the prefix through this.
+        let run = |args: &[&str]| -> Result<(), String> {
+            let status = self
+                .umu(&proton, "umu-run", RUN)
+                .args(args)
+                .status()
+                .map_err(|e| format!("umu-run {}: {e}", args[0]))?;
+            status.success().then_some(()).ok_or_else(|| format!("{} failed ({status})", args[0]))
+        };
+        crate::decal::install(&self.prefix, &game_dir, &self.cache, &wine_bin(&proton), &run, on)
+    }
+
     fn step_finalize(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
         if is_stamped(&self.prefix, SetupStep::Finalize) {
             on(Progress::skipped(SetupStep::Finalize, "already set up"));
@@ -388,6 +623,7 @@ impl Runtime for ProtonRuntime {
             SetupStep::InstallClient => self.step_install_client(on),
             SetupStep::ApplyUpdates => self.step_apply_updates(on),
             SetupStep::PatchClient => self.step_patch_client(on),
+            SetupStep::InstallDecal => self.step_install_decal(on),
             SetupStep::Finalize => self.step_finalize(on),
         }
     }
@@ -398,6 +634,60 @@ impl Runtime for ProtonRuntime {
 }
 
 // ----------------------------------------------------------------- setup helpers
+
+/// A path's last component, for progress messages.
+fn name_of(p: &Path) -> String {
+    p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
+/// The wine binary inside a Proton build.
+///
+/// The client is never launched with this — that goes through umu-run, because
+/// Proton's wine has no 32-bit GL outside the Steam runtime container and
+/// acclient.exe dies instantly. But two things Decal needs are not the client and
+/// do not touch GL:
+///
+///   * **winetricks**, which drives Microsoft's .NET 4.8 installer and wants
+///     `WINE`/`WINESERVER` to point at a binary it can run itself. Verified
+///     working against GE-Proton10-34 on Bazzite: real `clr.dll` installs.
+///   * **the engine hot-patch**, which only needs the path to locate
+///     `lib/wine/i386-windows` beside it.
+///
+/// `files/bin/wine` is the classic multilib build and is a genuine 32-bit ELF,
+/// which is what makes the first of those work at all.
+fn wine_bin(proton: &Path) -> PathBuf {
+    proton.join("files/bin/wine")
+}
+
+/// Recursively copy `src` to `dst`.
+///
+/// A Proton build is not a plain file tree: it is ~1.5 GB containing symlinks
+/// (`lib64`, and the DXVK/VKD3D DLLs) and executables whose mode matters.
+/// `std::fs::copy` carries permissions but **follows** symlinks, which would both
+/// bloat the copy and break links that deliberately point at siblings — so links
+/// are recreated as links, verbatim. Directory symlinks are recreated too rather
+/// than descended, which is also what stops a link cycle running away.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    let fail = |what: &str, p: &Path, e: std::io::Error| format!("{what} {}: {e}", p.display());
+    std::fs::create_dir_all(dst).map_err(|e| fail("creating", dst, e))?;
+    let entries = std::fs::read_dir(src).map_err(|e| fail("reading", src, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| fail("reading", src, e))?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        // symlink_metadata, not metadata: we are asking about the link itself.
+        let meta = std::fs::symlink_metadata(&from).map_err(|e| fail("reading", &from, e))?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&from).map_err(|e| fail("reading", &from, e))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to).map_err(|e| fail("linking", &to, e))?;
+        } else if meta.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(|e| fail("copying", &from, e))?;
+        }
+    }
+    Ok(())
+}
 
 /// The newest GE-Proton10 x86_64 .tar.gz on GitHub. Same query the script ran:
 /// scan recent releases, take the first matching asset, skip the aarch64 trap.

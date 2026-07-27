@@ -1,6 +1,6 @@
 //! The GTK frontend's glue to the launch path.
 //!
-//! Almost all of launching lives in `ac_core::proton`. The one thing that has to
+//! Almost all of launching lives in `ac_core::runtime`. The one thing that has to
 //! stay here is detecting the current display mode, because that needs a toolkit
 //! (Mutter over D-Bus, or GDK) and `ac-core` is deliberately toolkit-free so it
 //! can also build on macOS. We detect the resolution and hand it to the core.
@@ -10,14 +10,15 @@ use ac_core::servers::Server;
 pub use ac_core::Install;
 
 /// Launch the client at the current display resolution. Thin wrapper over
-/// `ac_core::proton::launch`; see it for the gamescope/DXVK coupling.
+/// `ac_core::runtime::launch`; see `ac_core::proton::launch` underneath it for the
+/// gamescope/DXVK coupling.
 pub fn launch(
     install: &Install,
     server: &Server,
     account: &str,
     password: &str,
 ) -> Result<std::process::Child, String> {
-    ac_core::proton::launch(install, server, account, password, current_resolution())
+    ac_core::runtime::launch(install, server, account, password, current_resolution())
 }
 
 /// The current display mode, in real pixels.

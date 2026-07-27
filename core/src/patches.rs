@@ -43,10 +43,24 @@ pub struct Patch {
     pub patched: &'static [u8],
     /// Skip this patch when the client is not going to run under macOS/Wine.
     ///
-    /// The two window-style patches below only make sense there: they exist to get
-    /// a macOS fullscreen Space out of winemac.drv. On Linux AC runs fullscreen
-    /// inside gamescope and never shows a window frame at all, so leaving the Linux
-    /// client byte-identical keeps that path exactly as it was.
+    /// Three of the five are gated, and for two different reasons.
+    ///
+    /// The **window-style** pair is meaningless elsewhere: it exists to get a
+    /// macOS fullscreen Space out of winemac.drv. On Linux AC runs fullscreen
+    /// inside gamescope and never shows a window frame at all.
+    ///
+    /// **`login-resolution` is gated because on Linux it would be a regression**,
+    /// which is a stronger statement than "unnecessary" and the reason this flag
+    /// is not just an optimisation. On macOS it trades a stretched pre-world
+    /// screen for a correctly-proportioned one drawn small in the corner, and that
+    /// trade was the user's explicit choice. Under gamescope there is no such
+    /// trade: AC's hardcoded 800x600 becomes an 800x600 device that gamescope —
+    /// a nested compositor sized to the display — scales up to fill the screen,
+    /// with the aspect handled for us. Removing the hardcoding would replace a
+    /// full-screen menu with the corner box for no gain at all.
+    ///
+    /// Leaving the Linux client byte-identical for all three keeps that path
+    /// exactly as it was.
     pub macos_only: bool,
 }
 
@@ -133,9 +147,20 @@ pub struct Patch {
 /// artwork anchored top-left — and it sits in the top-left corner of the window.
 /// There is no lever to change that: the forced-resolution globals have exactly four
 /// code references each, all inside the display-mode functions, so nothing in the UI
-/// reads them. The alternative (leave the screens at an 800x600 device and let
-/// wined3d stretch that backbuffer over the window) fills the screen but ignores
-/// aspect, which distorts 4:3 art on a widescreen display.
+/// reads them.
+///
+/// **The alternative was built, measured and reverted on 2026-07-26 — do not
+/// re-attempt it.** The idea was to leave the client at its own 800x600 device and
+/// give the *window* a 4:3 rect the size of the display, letting the renderer scale
+/// one over the other, the way the monitor does on real hardware. It cannot work
+/// here: `WINEDEBUG=+d3d` shows every present of a session as
+/// `src_rect (0,0)-(800,600), dst_rect (0,0)-(800,600)`, unchanged whatever the
+/// window does, because wined3d resolves the NULL destination AC passes to the
+/// *backbuffer* size rather than to the window's client rect. A bigger window only
+/// puts the same picture in the corner of a bigger frame — strictly worse than this.
+/// Scaling those screens for real needs a d3d9 renderer whose present blits through
+/// a scaling path (DXVK's does; wined3d's does not), or an exclusive-fullscreen
+/// 800x600 mode, which a MacBook's built-in panel does not offer.
 ///
 /// Known side effect: the `ForceDisplayResolution` console command (registered at
 /// 0x43bf3e) stops taking effect. It was never confirmed to work in the first place
@@ -499,9 +524,15 @@ mod tests {
         let first = apply_all(&client).unwrap();
         assert!(first.iter().all(|(_, o)| *o == Outcome::Applied), "{first:?}");
 
+        // Only what `apply_all` was asked to do. On Linux the macos_only patches
+        // are not in `applicable()`, so their sites must still hold the *expected*
+        // bytes -- asserting over all of PATCHES here failed on Linux from the day
+        // the split was introduced, which nothing noticed because the Linux build
+        // could not compile its test targets at all.
         let after = std::fs::read(&client).unwrap();
         for p in PATCHES {
-            assert_eq!(&after[p.offset..p.offset + p.patched.len()], p.patched, "{}", p.name);
+            let want = if applicable().any(|a| a.name == p.name) { p.patched } else { p.expect };
+            assert_eq!(&after[p.offset..p.offset + want.len()], want, "{}", p.name);
         }
 
         // The whole point: no .orig, no .patching, nothing but the client.

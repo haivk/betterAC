@@ -25,6 +25,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # known SHA-256 before unpacking, so a truncated or corrupt fetch fails loudly
 # rather than producing a half-broken runtime.
 sha2 = "0.10"
+# Managed DirectX ships as MSZip cabinets nested inside Microsoft's DirectX
+# redistributable. Wine's own `expand.exe` opens those cabinets and then fails the
+# extraction, and winetricks' equivalent verb shells out to `cabextract`, which a
+# stock Mac does not have — so the cabinets are unpacked in-process instead.
+cab = "0.6"
 
 [lib]
 name = "ac_core"

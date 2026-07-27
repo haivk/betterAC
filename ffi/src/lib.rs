@@ -15,51 +15,39 @@
 //! / `"{}"`). `ac_core_version` is the one exception: it returns a pointer to
 //! static memory and must NOT be freed.
 //!
-//! ## The runtime is platform-selected
+//! ## The runtime is platform-selected, but not here
 //!
-//! `make_runtime()` and `platform_launch()` resolve to the Wine runtime on macOS
-//! (the real target) and to Proton elsewhere, so this crate still compiles as part
-//! of the workspace on Linux. The setup thread and launch path are otherwise
-//! identical regardless of which one is underneath — that is the whole point of
-//! the shared `Runtime` trait.
+//! Choosing between the Wine runtime (macOS, the real target) and Proton
+//! (elsewhere, so this crate still compiles in the Linux workspace) is
+//! `ac_core::runtime`'s job. This file used to carry five copies of that
+//! `#[cfg]`; now it just calls. The setup thread and launch path are identical
+//! regardless of which runtime is underneath — that is the whole point of the
+//! shared `Runtime` trait.
 
 use ac_core::config::Config;
-use ac_core::install::Install;
+use ac_core::runtime;
 use ac_core::servers::Server;
-use ac_core::setup::{run_all, Progress, RunState, Runtime};
+use ac_core::setup::{run_all, Progress, RunState};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
-// --- platform selection -----------------------------------------------------
-
-#[cfg(target_os = "macos")]
-type PlatformRuntime = ac_core::wine::WineRuntime;
-#[cfg(not(target_os = "macos"))]
-type PlatformRuntime = ac_core::proton::ProtonRuntime;
-
 /// The runtime for this platform, pointed at the configured prefix.
-fn make_runtime() -> PlatformRuntime {
-    PlatformRuntime::new(Config::load().prefix)
+fn make_runtime() -> runtime::PlatformRuntime {
+    runtime::configured()
 }
 
-/// Launch the client through whichever runtime this platform uses. `res` is left
-/// `None` here; the frontend can pass a detected resolution in a later revision.
+/// Launch the client. `res` is left `None`: on macOS the runtime asks
+/// CoreGraphics for the main display itself, and the SwiftUI app has nothing
+/// better to tell it.
 fn platform_launch(
-    install: &Install,
+    install: &ac_core::Install,
     server: &Server,
     account: &str,
     password: &str,
 ) -> Result<std::process::Child, String> {
-    #[cfg(target_os = "macos")]
-    {
-        ac_core::wine::launch(install, server, account, password, None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        ac_core::proton::launch(install, server, account, password, None)
-    }
+    runtime::launch(install, server, account, password, None)
 }
 
 // --- C string helpers -------------------------------------------------------
@@ -149,7 +137,7 @@ pub unsafe extern "C" fn ac_config_set(json: *const c_char) -> *mut c_char {
 /// `ac_string_free`.
 #[no_mangle]
 pub extern "C" fn ac_detect() -> *mut c_char {
-    let v = match make_runtime().discover() {
+    let v = match runtime::discover() {
         Ok(install) => serde_json::json!({
             "ready": true,
             "ac_dir": install.ac_dir.to_string_lossy(),
@@ -242,7 +230,7 @@ pub unsafe extern "C" fn ac_launch(
         Ok(s) => s,
         Err(e) => return to_c(format!("ac_launch: invalid server JSON: {e}")),
     };
-    let install = match make_runtime().discover() {
+    let install = match runtime::discover() {
         Ok(i) => i,
         Err(e) => return to_c(e),
     };
@@ -273,6 +261,11 @@ pub extern "C" fn ac_reset_targets_json() -> *mut c_char {
 ///
 /// Refused while a setup run is in flight — deleting the prefix out from under
 /// the thread building it would leave a mess neither side could describe.
+///
+/// A *running* prefix is different: that one we end ourselves first. Decal's agent
+/// is left alive on purpose once opened (see [`ac_decal_open_settings`]), and
+/// deleting the prefix from under a live wineserver strands its menu-bar icon with
+/// nothing left on disk to explain it.
 #[no_mangle]
 pub extern "C" fn ac_reset() -> *mut c_char {
     {
@@ -280,6 +273,11 @@ pub extern "C" fn ac_reset() -> *mut c_char {
         if g.started && !g.done {
             return to_c("Setup is still running. Stop it before resetting.");
         }
+    }
+    // Unconditional, unlike the quit-time teardown: the prefix is about to be
+    // deleted, so anything still running in it has to go regardless.
+    if let Ok(install) = decal_install() {
+        runtime::shutdown_prefix(&install);
     }
     match ac_core::reset::reset() {
         Ok(_) => {
@@ -290,6 +288,142 @@ pub extern "C" fn ac_reset() -> *mut c_char {
             ptr::null_mut()
         }
         Err(e) => to_c(e),
+    }
+}
+
+// ------------------------------------------------------------------------ Decal
+//
+// Which plugins are on lives in the prefix registry, not in our config, because
+// that is what Decal itself reads. So these go straight to the prefix rather than
+// through `Config`; only the master on/off switch is a config field.
+
+/// An installed prefix, or an error string, for the Decal calls below.
+fn decal_install() -> Result<ac_core::Install, String> {
+    runtime::discover()
+}
+
+/// Is Decal provisioned in the prefix? `"1"` or `"0"`, so the UI can tell "off"
+/// from "on but not installed yet" and prompt to re-run setup.
+#[no_mangle]
+pub extern "C" fn ac_decal_installed() -> *mut c_char {
+    let installed = decal_install()
+        .map(|i| ac_core::decal::is_installed(&i.prefix))
+        .unwrap_or(false);
+    to_c(if installed { "1" } else { "0" })
+}
+
+/// The registered plugins, as a JSON array of `{"clsid","name","enabled"}`.
+/// Empty when Decal is not installed — not an error, just nothing to show.
+#[no_mangle]
+pub extern "C" fn ac_decal_plugins_json() -> *mut c_char {
+    let plugins = decal_install()
+        .map(|i| ac_core::decal::plugins(&i.prefix, &|args| runtime::query_in_prefix(&i, args)))
+        .unwrap_or_default();
+    to_c(serde_json::to_string(&plugins).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Turn one plugin on or off. Null on success, else an error string.
+///
+/// # Safety
+/// `clsid` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ac_decal_set_plugin(clsid: *const c_char, enabled: bool) -> *mut c_char {
+    let Some(clsid) = from_c(clsid) else {
+        return to_c("missing plugin id");
+    };
+    match decal_install().and_then(|i| {
+        ac_core::decal::set_plugin_enabled(&i.prefix, clsid, enabled, &|args| {
+            runtime::run_in_prefix(&i, args)
+        })
+    }) {
+        Ok(()) => ptr::null_mut(),
+        Err(e) => to_c(e),
+    }
+}
+
+/// Register a plugin from a DLL on disk, disabled. Returns null on success, else
+/// an error string.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ac_decal_add_plugin(path: *const c_char) -> *mut c_char {
+    let Some(path) = from_c(path) else {
+        return to_c("missing plugin path");
+    };
+    match decal_install().and_then(|i| {
+        ac_core::decal::add_plugin_from_dll(&i.prefix, std::path::Path::new(path), &|args| {
+            runtime::run_in_prefix(&i, args)
+        })
+    }) {
+        Ok(_) => ptr::null_mut(),
+        Err(e) => to_c(e),
+    }
+}
+
+/// Open Decal's own configuration UI (`DenAgent.exe`). Null on success, else an
+/// error string.
+///
+/// The agent has **no window**: it puts an icon in the menu bar and shows its
+/// dialog when that is clicked. So this returns as soon as the process is spawned,
+/// and the UI has to say where to look. It also stakes out no opinion about an
+/// agent that is already running — Decal's own single-instance handling does, and
+/// a second launch just surfaces the first.
+#[no_mangle]
+pub extern "C" fn ac_decal_open_settings() -> *mut c_char {
+    match decal_install()
+        .and_then(|i| ac_core::decal::open_settings(&i.prefix, &|args| runtime::spawn_in_prefix(&i, args)))
+    {
+        Ok(()) => ptr::null_mut(),
+        Err(e) => to_c(e),
+    }
+}
+
+/// Install a Decal plugin from a `.zip`, `.msi` or `.exe` on the host filesystem.
+/// Null on success, else an error string.
+///
+/// A zip is the best thing to pass: it is unpacked into the prefix whole and the
+/// installer inside is run, so nothing has to be guessed about which neighbouring
+/// files that installer needs.
+///
+/// **Blocks until the installer is done**, which includes however long the user
+/// spends in its dialogs — the package gets its own UI, since a third-party
+/// installer may have questions only the user can answer. Call it off the UI
+/// thread.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ac_decal_install_plugin(path: *const c_char) -> *mut c_char {
+    let Some(path) = from_c(path) else {
+        return to_c("missing installer path");
+    };
+    match decal_install().and_then(|i| {
+        ac_core::decal::install_plugin(&i.prefix, std::path::Path::new(path), &|args| {
+            runtime::run_in_prefix(&i, args)
+        })
+    }) {
+        Ok(()) => ptr::null_mut(),
+        Err(e) => to_c(e),
+    }
+}
+
+/// Shut down everything still running in the prefix. Call when the app quits.
+///
+/// End the Wine session at quit, if this run of the app left anything in it.
+///
+/// Decal's agent outlives the settings sheet by design, and its status icon is
+/// owned by the prefix's `explorer.exe`, not by the agent — so leaving the session
+/// up leaks an icon nothing else will clear. Silent: at quit there is nobody left
+/// to report a failure to, and the usual case is nothing to kill.
+///
+/// Killing the session ends the **game** too, so this is a no-op unless the agent
+/// was actually started — see `ac_core::runtime::shutdown_on_quit`. It used to be
+/// unconditional, which meant quitting the launcher mid-session killed the game.
+#[no_mangle]
+pub extern "C" fn ac_decal_shutdown() {
+    if let Ok(install) = decal_install() {
+        runtime::shutdown_on_quit(&install);
     }
 }
 

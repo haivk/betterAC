@@ -112,14 +112,23 @@ pub struct Invocation {
 ///
 /// Without gamescope we leave Proton alone and DXVK stays on, because there the
 /// old failure is still real.
+///
+/// `decal` is the Windows path of the Decal injector when the plugin framework is
+/// switched on and installed, else `None`. It runs *in front of* the client and
+/// starts it itself, so the client's own arguments are unchanged and a launch with
+/// Decal off is byte-identical to one from before the feature existed.
 pub fn invocation(
     server: &Server,
     account: &str,
     password: &str,
     gamescope: bool,
     gamescope_args: &[String],
+    decal: Option<&str>,
 ) -> Invocation {
-    let client = std::iter::once("acclient.exe".to_string())
+    let client = decal
+        .map(|injector| injector.to_string())
+        .into_iter()
+        .chain(std::iter::once("acclient.exe".to_string()))
         .chain(client_args(server, account, password));
 
     if gamescope {
@@ -235,7 +244,7 @@ mod tests {
 
     #[test]
     fn gamescope_wraps_umu_run_and_the_client_argv_survives_the_separator() {
-        let inv = invocation(&srv(Software::Ace), "hank", "hunter2", true, &gs_args());
+        let inv = invocation(&srv(Software::Ace), "hank", "hunter2", true, &gs_args(), None);
         assert_eq!(inv.program, "gamescope");
         assert_eq!(
             inv.args,
@@ -258,7 +267,7 @@ mod tests {
     fn gamescope_h_and_the_clients_h_do_not_collide() {
         // Both use -h: gamescope means "game height", acclient means "host". They
         // are only unambiguous because one is before the -- and one is after it.
-        let inv = invocation(&srv(Software::Ace), "hank", "pw", true, &gs_args());
+        let inv = invocation(&srv(Software::Ace), "hank", "pw", true, &gs_args(), None);
         let sep = inv.args.iter().position(|a| a == "--").unwrap();
         let hs: Vec<usize> =
             inv.args.iter().enumerate().filter(|(_, a)| *a == "-h").map(|(i, _)| i).collect();
@@ -273,24 +282,47 @@ mod tests {
     fn turning_gamescope_on_turns_dxvk_off_and_leaving_it_off_leaves_dxvk_on() {
         // The coupling is the whole point: wined3d cannot enumerate a display on a
         // bare Wayland session, so it is only safe once gamescope provides one.
-        assert!(invocation(&srv(Software::Ace), "u", "p", true, &gs_args()).wined3d);
-        assert!(!invocation(&srv(Software::Ace), "u", "p", false, &gs_args()).wined3d);
+        assert!(invocation(&srv(Software::Ace), "u", "p", true, &gs_args(), None).wined3d);
+        assert!(!invocation(&srv(Software::Ace), "u", "p", false, &gs_args(), None).wined3d);
     }
 
     #[test]
     fn without_gamescope_we_exec_umu_run_directly() {
-        let inv = invocation(&srv(Software::Gdle), "hank", "hunter2", false, &gs_args());
+        let inv = invocation(&srv(Software::Gdle), "hank", "hunter2", false, &gs_args(), None);
         assert_eq!(inv.program, "umu-run");
         assert_eq!(inv.args[0], "acclient.exe");
         assert!(!inv.args.contains(&"--".to_string()));
         assert!(inv.args.contains(&"hank:hunter2".to_string()));
     }
 
+    /// Decal has to be additive: it runs in front of the client and starts it
+    /// itself, so the client's own argv must not move or change. The regression
+    /// this guards is a launch with Decal off differing in any way from a launch
+    /// from before the feature existed.
+    #[test]
+    fn decal_prepends_the_injector_and_leaves_the_client_arguments_alone() {
+        let injector = r"C:\Program Files (x86)\Decal 3.0\decinject.exe";
+        let off = invocation(&srv(Software::Ace), "hank", "pw", false, &gs_args(), None);
+        let on = invocation(&srv(Software::Ace), "hank", "pw", false, &gs_args(), Some(injector));
+
+        assert_eq!(off.args[0], "acclient.exe");
+        assert_eq!(on.args[0], injector);
+        assert_eq!(on.args[1], "acclient.exe");
+        assert_eq!(on.args[2..], off.args[1..], "the client's own arguments must be untouched");
+        assert_eq!(on.program, off.program);
+
+        // Under gamescope the injector still lands immediately after umu-run.
+        let gs = invocation(&srv(Software::Ace), "hank", "pw", true, &gs_args(), Some(injector));
+        let umu = gs.args.iter().position(|a| a == "umu-run").unwrap();
+        assert_eq!(gs.args[umu + 1], injector);
+        assert_eq!(gs.args[umu + 2], "acclient.exe");
+    }
+
     #[test]
     fn custom_gamescope_args_replace_the_defaults_but_not_the_client() {
         let custom: Vec<String> =
             "-w 2752 -h 1152 -F fsr -f".split_whitespace().map(String::from).collect();
-        let inv = invocation(&srv(Software::Ace), "hank", "pw", true, &custom);
+        let inv = invocation(&srv(Software::Ace), "hank", "pw", true, &custom, None);
         assert_eq!(&inv.args[..6], ["-w", "2752", "-h", "1152", "-F", "fsr"]);
         assert!(!inv.args.contains(&"--force-grab-cursor".to_string()));
         assert!(inv.args.contains(&"acclient.exe".to_string()));

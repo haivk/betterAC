@@ -34,7 +34,7 @@
 use crate::args::{client_args, validate};
 use crate::fetch::{download, extract_tar_gz, extract_zip, verify_sha256};
 use crate::gamefiles::GameSources;
-use crate::install::{engine_dir, find_acclient, find_game_dir, Install};
+use crate::install::{find_acclient, find_game_dir, runtime_dir, Install};
 use crate::patches;
 use crate::prefs::{env_flag, env_resolution};
 use crate::servers::Server;
@@ -106,9 +106,9 @@ impl WineRuntime {
     }
 
     /// The engine root to look inside for `bin/wine`. The `AC_WINE_ENGINE` override
-    /// wins; otherwise the self-provisioned `engine_dir()`.
+    /// wins; otherwise the self-provisioned `runtime_dir()`.
     fn engine_root(&self) -> PathBuf {
-        self.engine_override.clone().unwrap_or_else(engine_dir)
+        self.engine_override.clone().unwrap_or_else(runtime_dir)
     }
 
     /// Locate the wine binary, or `None` if the engine isn't present yet. If the
@@ -131,6 +131,15 @@ impl WineRuntime {
     fn wine(&self, wine_bin: &Path) -> Command {
         let mut c = Command::new(wine_bin);
         c.env("WINEPREFIX", &self.prefix).env("WINEDEBUG", "-all");
+        // Give Wine a working directory it can map to a DOS path. We drop the drives
+        // that reach the host filesystem (no Z:), so inheriting the launcher's cwd
+        // leaves Wine unable to map it — it warns and starts in the Windows dir, and
+        // msiexec /a fails outright. `drive_c` always maps to C:. Skipped before it
+        // exists (the wineboot that creates it), where the default cwd is fine.
+        let drive_c = self.prefix.join("drive_c");
+        if drive_c.is_dir() {
+            c.current_dir(drive_c);
+        }
         c
     }
 
@@ -213,7 +222,7 @@ impl WineRuntime {
             }
         }
         on(Progress::new(SetupStep::InstallRuntime, 0.4, "unpacking the Wine engine…"));
-        let dest = engine_dir();
+        let dest = runtime_dir();
         std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
         extract_tar_gz(&tarball, &dest)?;
         // Gatekeeper quarantines everything downloaded; strip it so the engine's
@@ -248,10 +257,11 @@ impl WineRuntime {
             .wine(&wine)
             .args(["reg", "add", r"HKCU\Software\Wine", "/v", "Version", "/t", "REG_SZ", "/d", "win7", "/f"])
             .status();
-        // Keep the profile inside the prefix before anything (the installer, the
-        // client, us) writes to Documents/Desktop and reaches the real home.
-        on(Progress::new(SetupStep::Prefix, 0.9, "containing the Wine user profile…"));
-        contain_user_profile(&self.prefix);
+        // Seal the prefix off from the host before anything (the installer, the
+        // client, us) can write out to the real home or reach the host filesystem:
+        // contain the profile folders and drop the drives that map outside.
+        on(Progress::new(SetupStep::Prefix, 0.9, "sealing the prefix off from the host…"));
+        harden_prefix(&self.prefix);
         mark_stamped(&self.prefix, SetupStep::Prefix).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -279,9 +289,18 @@ impl WineRuntime {
             0.1,
             "the Asheron's Call installer is open — click through it and accept the default path",
         ));
+        // The installer lives in the download cache, outside the prefix, and the
+        // prefix no longer maps the host filesystem (harden_prefix drops Z:). So
+        // stage a copy inside C: and run that; remove it afterwards.
+        let staged = self.prefix.join("drive_c").join(
+            installer.file_name().ok_or("the installer has no file name")?,
+        );
+        std::fs::copy(&installer, &staged)
+            .map_err(|e| format!("staging the installer into the prefix: {e}"))?;
         // The real wizard, drawn by Wine's Mac driver. Non-zero exit is tolerated;
         // we verify success by the data file it drops.
-        let _ = self.wine(&wine).arg(&installer).status();
+        let _ = self.wine(&wine).arg(windows_path(&self.prefix, &staged)).status();
+        let _ = std::fs::remove_file(&staged);
         find_game_dir(&self.prefix)
             .ok_or("no client_portal.dat found under the prefix -- did the install finish?")?;
         mark_stamped(&self.prefix, SetupStep::InstallClient).map_err(|e| e.to_string())?;
@@ -346,6 +365,35 @@ impl WineRuntime {
         Ok(())
     }
 
+    /// Provision Decal, but only if the user opted in on the setup screen. Off is
+    /// the default, so for most installs this downloads nothing and does nothing.
+    ///
+    /// Deliberately stampless (see [`SetupStep::stamp`]): the opt-in is read from
+    /// config, and a resumed run must re-evaluate it rather than remember an earlier
+    /// "no".
+    fn step_install_decal(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
+        if !crate::config::Config::load().decal.enabled {
+            on(Progress::skipped(SetupStep::InstallDecal, "Decal was not selected"));
+            return Ok(());
+        }
+        let wine = self.wine_bin().ok_or("no Wine engine available to install Decal")?;
+        if crate::decal::is_installed(&self.prefix) {
+            // Re-apply the parts that live outside the Decal directory -- the
+            // injector and cohook ship with the app, and the engine hot-patch lives
+            // in the engine, so an app update or a re-provisioned engine loses them.
+            crate::decal::ensure_runtime_hooks(&self.prefix, &wine)?;
+            on(Progress::skipped(SetupStep::InstallDecal, "Decal is already installed"));
+            return Ok(());
+        }
+        let game_dir = find_game_dir(&self.prefix).ok_or("game directory not found for Decal")?;
+        let run = |args: &[&str]| -> Result<(), String> {
+            let status =
+                self.wine(&wine).args(args).status().map_err(|e| format!("{}: {e}", args[0]))?;
+            status.success().then_some(()).ok_or_else(|| format!("{} failed ({status})", args[0]))
+        };
+        crate::decal::install(&self.prefix, &game_dir, &self.cache, &wine, &run, on)
+    }
+
     fn step_finalize(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
         if is_stamped(&self.prefix, SetupStep::Finalize) {
             on(Progress::skipped(SetupStep::Finalize, "already set up"));
@@ -373,6 +421,7 @@ impl Runtime for WineRuntime {
             SetupStep::InstallClient => self.step_install_client(on),
             SetupStep::ApplyUpdates => self.step_apply_updates(on),
             SetupStep::PatchClient => self.step_patch_client(on),
+            SetupStep::InstallDecal => self.step_install_decal(on),
             SetupStep::Finalize => self.step_finalize(on),
         }
     }
@@ -429,7 +478,8 @@ impl Runtime for WineRuntime {
 ///   * **`login-resolution`** removes the client's hardcoded 800x600 for the splash,
 ///     login and character-select screens, so the whole session is one window at one
 ///     size, fullscreen from the first frame. (Those screens still *draw* their UI at
-///     800x600 in the top-left — that is fixed-pixel artwork with no scaling hook;
+///     800x600 in the top-left — that is fixed-pixel artwork with no scaling hook,
+///     and the attempt to scale it by resizing the window was measured and reverted;
 ///     see the patch's notes.)
 ///   * **`acspaces.dylib`** is injected into the Wine process via
 ///     `DYLD_INSERT_LIBRARIES` and, from *inside* that process (so no Accessibility
@@ -452,9 +502,9 @@ pub fn launch(
 ) -> Result<Child, String> {
     validate(server, account, password)?;
 
-    // Existing prefixes were created before we contained the profile; do it here
-    // too so the game never reaches the real ~/Documents, ~/Desktop, ~/Music.
-    contain_user_profile(&install.prefix);
+    // Keep the game inside its prefix — profile and drives — every launch, so a
+    // prefix built before this existed is hardened on its next run too.
+    harden_prefix(&install.prefix);
 
     let resolution = env_resolution().or(res).or_else(display::main_resolution);
     let mode = LaunchMode::choose(
@@ -472,8 +522,28 @@ pub fn launch(
         crate::prefs::apply(&install.ac_dir, &install.prefix, (w, h), mode.ac_fullscreen());
     }
 
+    // Keep the client's patches current. They ship with the app, not with the
+    // prefix, so an install set up by an older build would otherwise never see a
+    // patch added since -- the setup step that applies them does not run again once
+    // setup is complete. `apply_all` is idempotent and only writes when something
+    // actually changed, and a failure here is not worth refusing to launch over.
+    let _ = crate::patches::apply_all(&install.ac_dir.join("acclient.exe"));
+
     let mut argv: Vec<String> = Vec::new();
     let mut client = "acclient.exe".to_string();
+    // Decal, when switched on and provisioned: the injector runs in front of the
+    // client and starts it itself. Inside a virtual desktop it slots between
+    // explorer and the client, which is why this is resolved before the mode check.
+    let injector = crate::decal::launch_injector(&install.prefix);
+    if injector.is_some() {
+        // Best-effort, and on every launch so a prefix built before these existed
+        // gets them: without the config the plugins load but draw nothing, and
+        // without the MSIL flip their binds against Decal are refused outright. A
+        // failure here must not stop the game starting — losing plugins beats losing
+        // the game, the same rule the injector itself follows.
+        let _ = crate::decal::ensure_runtime_config(&install.ac_dir);
+        let _ = crate::decal::ensure_msil_assemblies(&install.prefix, &install.ac_dir);
+    }
     if let (LaunchMode::Desktop, Some((w, h))) = (mode, resolution) {
         // wine explorer /desktop=NAME,WxH  C:\...\acclient.exe <args>
         //
@@ -484,6 +554,9 @@ pub fn launch(
         argv.push(format!("/desktop=betterac,{w}x{h}"));
         client = windows_path(&install.prefix, &install.ac_dir.join("acclient.exe"));
     }
+    if let Some(injector) = &injector {
+        argv.push(injector.clone());
+    }
     argv.push(client);
     argv.extend(client_args(server, account, password));
 
@@ -493,6 +566,9 @@ pub fn launch(
     let spaces_dylib = matches!(mode, LaunchMode::Spaces).then(ensure_spaces_helper).flatten();
 
     // `install.proton` holds the wine binary on macOS (see `discover`).
+    // `BETTERAC_WINEDEBUG` overrides the silent default so a launch can be traced
+    // (e.g. to see what Decal loads); unset, it stays quiet as normal play wants.
+    let winedebug = std::env::var("BETTERAC_WINEDEBUG").unwrap_or_else(|_| "-all".into());
     let mut cmd = Command::new(&install.proton);
     cmd.args(&argv)
         .current_dir(&install.ac_dir)
@@ -500,7 +576,7 @@ pub fn launch(
         // Builtin d3d9 = wined3d. Step Zero proved AC renders this way and DXVK
         // never engaged, so there is no native d3d9 to prefer and no Vulkan layer.
         .env("WINEDLLOVERRIDES", "d3d9=b")
-        .env("WINEDEBUG", "-all");
+        .env("WINEDEBUG", &winedebug);
     if let Some(dylib) = &spaces_dylib {
         // Inject the auto-fullscreen dylib into the Wine process. It calls AC's own
         // window's -toggleFullScreen: from *inside* the process, so no Accessibility
@@ -518,6 +594,91 @@ pub fn launch(
     })?;
 
     Ok(child)
+}
+
+/// Run a Windows program inside an installed prefix — the [`crate::decal`]
+/// operations the settings UI performs (importing a `.reg`, mostly) need one of
+/// these, and how you get to a Windows program differs per platform.
+pub fn run_in_prefix(install: &Install, args: &[&str]) -> Result<(), String> {
+    let status = wine_cmd(install, args)
+        .status()
+        .map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"wine")))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{} failed ({status})", args.first().unwrap_or(&"wine")))
+}
+
+/// Like [`run_in_prefix`], but returns as soon as the program is running instead of
+/// waiting for it to exit. For Windows programs that stay up — Decal's agent, which
+/// lives in the menu bar until it is asked to quit.
+///
+/// The `Child` is dropped, so the process is never reaped by us; it is the prefix's
+/// wineserver that owns its lifetime, and [`shutdown_prefix`] is how it ends.
+pub fn spawn_in_prefix(install: &Install, args: &[&str]) -> Result<(), String> {
+    wine_cmd(install, args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"wine")))
+}
+
+/// End everything running in the prefix, via `wineserver -k`.
+///
+/// Called when betterAC quits. Without it, a Windows program that outlives the app
+/// keeps its menu-bar status item — and, worse, those items are owned by the
+/// prefix's `explorer.exe` rather than by the program itself, so an agent that dies
+/// abruptly leaves a **dead icon** behind that nothing later will clear. Killing
+/// the session is the only thing that reliably removes them.
+///
+/// Best-effort and non-blocking in spirit: any failure just means there was nothing
+/// to kill, which is the normal case.
+pub fn shutdown_prefix(install: &Install) {
+    let server = install.proton.with_file_name("wineserver");
+    if !server.is_file() {
+        return;
+    }
+    let run = |arg: &str| {
+        let _ = Command::new(&server)
+            .arg(arg)
+            .env("WINEPREFIX", &install.prefix)
+            .env("WINEDEBUG", "-all")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    };
+    run("-k");
+    // `-k` only asks; it returns before the server has gone. On its way out
+    // wineserver flushes the registry and rewrites `.update-timestamp`, so anything
+    // that deletes the prefix immediately after racks up files reappearing
+    // underneath it — a reset would empty the prefix and then fail to remove the
+    // directory itself. `-w` waits for the server to actually exit, and returns at
+    // once when there is none.
+    run("-w");
+}
+
+/// Like [`run_in_prefix`], but returns the program's stdout. Used for `reg query`.
+pub fn query_in_prefix(install: &Install, args: &[&str]) -> Result<String, String> {
+    let out = wine_cmd(install, args)
+        .output()
+        .map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"wine")))?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .ok_or_else(|| format!("{} failed", args.first().unwrap_or(&"wine")))
+}
+
+fn wine_cmd(install: &Install, args: &[&str]) -> Command {
+    let mut c = Command::new(&install.proton);
+    c.args(args).env("WINEPREFIX", &install.prefix).env("WINEDEBUG", "-all");
+    // A working directory Wine can map to a DOS path — the drives that reach the
+    // host are gone, so an inherited cwd would leave Wine warning and rootless.
+    let drive_c = install.prefix.join("drive_c");
+    if drive_c.is_dir() {
+        c.current_dir(drive_c);
+    }
+    c
 }
 
 /// Write the embedded macOS fullscreen-Space dylib to the support dir and return its
@@ -652,33 +813,101 @@ fn windows_path(prefix: &Path, path: &Path) -> String {
 /// kept.
 fn contain_user_profile(prefix: &Path) {
     let users = prefix.join("drive_c/users");
-    let canon_prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
     let Ok(user_dirs) = std::fs::read_dir(&users) else { return };
     for user in user_dirs.flatten() {
         let Ok(items) = std::fs::read_dir(user.path()) else { continue };
         for item in items.flatten() {
             let p = item.path();
-            let is_symlink =
-                std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
-            if !is_symlink {
-                continue;
-            }
-            let escapes = match std::fs::read_link(&p) {
-                Ok(target) => {
-                    let abs = if target.is_absolute() {
-                        target
-                    } else {
-                        p.parent().map(|d| d.join(&target)).unwrap_or(target)
-                    };
-                    let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
-                    !canon.starts_with(&canon_prefix)
-                }
-                Err(_) => true,
-            };
-            if escapes {
+            if symlink_escapes(prefix, &p) {
+                // Replace the escaping link with a real, empty in-prefix folder.
                 let _ = std::fs::remove_file(&p);
                 let _ = std::fs::create_dir_all(&p);
             }
+        }
+    }
+}
+
+/// Is `p` a symlink whose target resolves outside the prefix? `remove_file` on a
+/// symlink drops only the link, so callers can sever an escape without touching
+/// whatever it pointed at.
+fn symlink_escapes(prefix: &Path, p: &Path) -> bool {
+    let canon_prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    if !std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    match std::fs::read_link(p) {
+        Ok(target) => {
+            let abs = if target.is_absolute() {
+                target
+            } else {
+                p.parent().map(|d| d.join(&target)).unwrap_or(target)
+            };
+            let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+            !canon.starts_with(&canon_prefix)
+        }
+        Err(_) => true,
+    }
+}
+
+/// Lock the game inside its prefix, on every launch as well as at prefix creation
+/// (so a prefix built before this existed is hardened on its next launch — the
+/// operations are cheap and idempotent):
+///
+///   * **profile** — the Wine profile folders (Documents, Desktop, …) are pointed
+///     at the real Mac home by default, so anything the client writes there lands
+///     in the user's actual files; [`contain_user_profile`] replaces those links
+///     with contained folders.
+///   * **drives** — `Z:` maps the whole host filesystem and `D:` the engine's
+///     source volume, so a Windows-side program (the client, a plugin) could reach
+///     anywhere on the Mac. [`contain_drives`] removes every drive that leaves the
+///     prefix, keeping only `C:`. Nothing we run needs the others — setup stages
+///     the files it installs into `C:` first.
+///
+/// ## Why this is macOS-only
+///
+/// Measured on a live Proton prefix (Bazzite, 2026-07-27) rather than assumed,
+/// because "harden both platforms" is the obvious-looking call and it is wrong:
+///
+///   * **Profile containment is already true on Linux.** Proton creates
+///     `drive_c/users/steamuser/{Documents,Desktop,Music,…}` as *real
+///     directories*, not as symlinks into `$HOME` the way plain Wine does. There
+///     is nothing to sever, so running this there would be a no-op — and the
+///     macOS-specific half of the motivation (TCC privacy prompts for Documents
+///     and Desktop) does not exist on Linux either.
+///   * **Drive containment would need setup rewritten to match.** The Linux
+///     prefix genuinely does escape (`z:`→`/`, `x:`→`$HOME`, `s:`, `u:`, `v:`),
+///     but Linux setup reaches its downloads *through* those drives: the game
+///     installer and winetricks both run from host cache paths. macOS could drop
+///     them only because [`step_install_client`](WineRuntime::step_install_client)
+///     and Decal's MSI stage their files into `C:` first. On top of that Proton
+///     re-runs `wineboot` on every launch, which recreates them.
+///
+/// So Linux keeps its drives. Doing it properly there is a real piece of work
+/// with a real payoff, not a comment away.
+///
+/// Nothing here touches the systray. There used to be a step that set
+/// `HKCU\Software\Wine\Explorer` `ShowSystray` and the `NoTrayItemsDisplay` policy
+/// to stop Decal's agent becoming a macOS menu-bar item; it never worked. Both
+/// values are in this engine's `explorer.exe`, and both were set correctly in the
+/// prefix, and the status item appeared regardless — gcenx's build does not honour
+/// them. It is also no longer wanted: the agent has no window, so that icon *is*
+/// Decal's settings UI (see [`crate::decal::open_settings`]). Stray icons are dealt
+/// with at the other end instead, by [`shutdown_prefix`] on quit.
+fn harden_prefix(prefix: &Path) {
+    contain_user_profile(prefix);
+    contain_drives(prefix);
+}
+
+/// Remove every `dosdevices` drive that points outside the prefix. `C:` maps
+/// `../drive_c` (inside) and stays; `Z:`→`/`, `D:`→a host volume and the like are
+/// severed. Runs before every launch because some wineboot paths recreate `Z:`.
+fn contain_drives(prefix: &Path) {
+    let dosdevices = prefix.join("dosdevices");
+    let Ok(entries) = std::fs::read_dir(&dosdevices) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if symlink_escapes(prefix, &p) {
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
@@ -808,7 +1037,7 @@ mod tests {
             prefix: PathBuf::from("/tmp/does-not-exist-betterac-test"),
             cache: PathBuf::from("/tmp/does-not-exist-betterac-test/cache"),
             // A guaranteed-empty engine root, so the tests don't depend on whether
-            // this dev machine happens to have a real engine in engine_dir().
+            // this dev machine happens to have a real engine in runtime_dir().
             engine_override: Some(PathBuf::from("/tmp/does-not-exist-betterac-engine")),
             engine_url: String::new(),
             engine_sha256: None,

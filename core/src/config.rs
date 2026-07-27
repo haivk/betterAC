@@ -63,6 +63,19 @@ impl Entry {
     }
 }
 
+/// Decal, the third-party plugin framework. Off unless asked for: enabling it is
+/// what makes setup download and provision it, and what puts the injector in the
+/// launch command line.
+///
+/// Which *plugins* are on is deliberately not stored here. The prefix registry is
+/// the source of truth for that, because it is what Decal itself reads — see
+/// [`crate::decal::plugins`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// The Proton prefix built by setup.
@@ -73,6 +86,8 @@ pub struct Config {
     /// id() of the last server played, so we reselect it on open.
     #[serde(default)]
     pub last: Option<String>,
+    #[serde(default)]
+    pub decal: DecalConfig,
 }
 
 impl Default for Config {
@@ -81,6 +96,7 @@ impl Default for Config {
             prefix: crate::install::default_prefix(),
             servers: Vec::new(),
             last: None,
+            decal: DecalConfig::default(),
         }
     }
 }

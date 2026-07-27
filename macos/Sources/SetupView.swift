@@ -23,6 +23,10 @@ struct SetupView: View {
     @State private var run = SetupRun()
     /// Set once the user commits, so the list is a plan before and a queue after.
     @State private var started = false
+    /// The one choice setup asks for up front: whether to install Decal. Decided
+    /// here because settings is out of reach until setup finishes, and we do not
+    /// want the plugin framework provisioned unless the user asked for it.
+    @State private var installDecal = false
     /// A stop has been asked for but the run hasn't noticed yet — a download stops
     /// at once, but wineboot or the installer wizard has to return first.
     @State private var stopping = false
@@ -46,13 +50,22 @@ struct SetupView: View {
                     .frame(maxWidth: 500, alignment: .leading)
             }
 
+            // Asked before the run, hidden once it starts: the Decal opt-in.
+            if !started {
+                decalOptIn
+            }
+
             buttons
         }
         .padding(28)
         .animation(.easeInOut(duration: 0.2), value: visibleSteps.map(\.id))
         // Ask the core for the step list up front: before setup starts it answers
         // with every step pending, which is exactly the plan we want to show.
-        .task { refresh() }
+        .task {
+            refresh()
+            // Resume with whatever was chosen last, so a re-run remembers it.
+            installDecal = ACCore.loadConfig().decal.enabled
+        }
     }
 
     /// The plan before the run, the queue during it. Finished steps fall off the
@@ -94,6 +107,22 @@ struct SetupView: View {
         return "Step \(at) of \(total)"
     }
 
+    /// The install-time question. A checkbox rather than a modal so it sits with
+    /// the plan and the "Installing Decal" step it controls, and the user sees the
+    /// choice before committing.
+    private var decalOptIn: some View {
+        Toggle(isOn: $installDecal) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Install Decal")
+                Text("An optional third-party plugin framework for Asheron's Call. You can turn individual plugins on and off in Settings afterwards.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.checkbox)
+        .frame(maxWidth: 500, alignment: .leading)
+    }
+
     @ViewBuilder
     private var buttons: some View {
         HStack(spacing: 12) {
@@ -124,6 +153,12 @@ struct SetupView: View {
     private func start() {
         started = true
         stopping = false
+        // Persist the Decal choice before the run reads it: the InstallDecal step
+        // installs Decal iff this is set. This is the only place a first-time user
+        // can make that call, since settings is unreachable until setup finishes.
+        var config = ACCore.loadConfig()
+        config.decal.enabled = installDecal
+        ACCore.saveConfig(config)
         ACCore.startSetup()
         poll()
     }

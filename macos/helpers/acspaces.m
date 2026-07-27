@@ -18,6 +18,18 @@
 // login and character-select screens, so there is one window of one size for the
 // whole session and nothing here has to wait for the world to load.
 //
+// Those screens still *draw* their artwork at 800x600, in the top-left corner of the
+// window, and that is accepted rather than unsolved. It was attempted on 2026-07-26
+// by growing the window to the display and letting the renderer scale the picture
+// over it, which does not work and cannot be made to: `WINEDEBUG=+d3d` shows every
+// present of a session as `src_rect (0,0)-(800,600), dst_rect (0,0)-(800,600)`,
+// unchanged whatever the window does, because wined3d resolves the NULL destination
+// AC passes to the *backbuffer* size rather than to the window's client rect. A
+// bigger window only puts the same picture in the corner of a bigger frame. Scaling
+// them for real needs a d3d9 renderer whose present blits through a scaling path
+// (DXVK's does; wined3d's does not), or an exclusive-fullscreen 800x600 display
+// mode, which a MacBook's built-in panel does not offer.
+//
 // Rebuild with macos/helpers/build.sh (or core/build.rs does it automatically).
 
 #import <AppKit/AppKit.h>

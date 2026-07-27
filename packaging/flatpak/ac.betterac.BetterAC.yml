@@ -40,11 +40,14 @@
 #      freedesktop runtime). Bundling it means building it here against Vulkan,
 #      wayland and libdrm.
 #
-#   4. GE-Proton is downloaded at runtime into core/src/install.rs::steam_compat()
-#      = ~/.local/share/Steam/compatibilitytools.d. With --filesystem=home below
-#      that IS the real path, so a Flatpak build shares GE-Proton with the host's
-#      Steam rather than duplicating 400 MB into ~/.var/app. That is the reason
-#      for the broad filesystem permission; narrowing it means duplicating.
+#   4. The Windows runtime lives at core/src/install.rs::runtime_dir()
+#      = ~/.local/share/betterac/proton, copied from (never run out of) Steam's
+#      ~/.local/share/Steam/compatibilitytools.d if a GE-Proton build is already
+#      there. With --filesystem=home below both are real host paths, so the copy
+#      is a local one rather than a 500 MB download. betterAC needs its own build
+#      because provisioning Decal hot-patches it, which is not something to do to
+#      a build Steam shares. That is the reason for the broad filesystem
+#      permission; narrowing it means downloading instead of copying.
 #
 # The other route is --talk-name=org.freedesktop.Flatpak plus flatpak-spawn --host
 # to run the host's tools. It works and it is much less code, but it is sandbox
@@ -70,9 +73,10 @@ finish-args:
   # The server directory comes from treestats, and setup downloads the runtime
   # and the game files.
   - --share=network
-  # The prefix (~/Games/asherons-call) and GE-Proton
-  # (~/.local/share/Steam/compatibilitytools.d) are host paths the launcher owns.
-  # See note 4 above: this is what keeps GE-Proton shared with Steam.
+  # The prefix (~/Games/asherons-call) and the runtime
+  # (~/.local/share/betterac/proton) are host paths the launcher owns, and
+  # Steam's compatibilitytools.d is read to copy a GE-Proton build out of.
+  # See note 4 above.
   - --filesystem=home
 
 modules:

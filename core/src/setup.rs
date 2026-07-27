@@ -99,6 +99,9 @@ pub enum SetupStep {
     ApplyUpdates,
     /// Byte-patch the client for defects that config cannot reach (see `patches`).
     PatchClient,
+    /// Provision the Decal plugin framework — only when the user opted in on the
+    /// setup screen (see `decal`).
+    InstallDecal,
     /// Write the direct-launch escape hatch and mark the install complete.
     Finalize,
 }
@@ -107,7 +110,7 @@ impl SetupStep {
     /// Every step, in run order. Downloads first: they are the long unattended
     /// stretch, and getting them done before the installer wizard means the user
     /// is only interrupted once, at a predictable point.
-    pub const ALL: [SetupStep; 11] = [
+    pub const ALL: [SetupStep; 12] = [
         SetupStep::Dependencies,
         SetupStep::DownloadRuntime,
         SetupStep::DownloadClient,
@@ -118,6 +121,7 @@ impl SetupStep {
         SetupStep::InstallClient,
         SetupStep::ApplyUpdates,
         SetupStep::PatchClient,
+        SetupStep::InstallDecal,
         SetupStep::Finalize,
     ];
 
@@ -134,6 +138,7 @@ impl SetupStep {
             SetupStep::InstallClient => "Installing Asheron's Call",
             SetupStep::ApplyUpdates => "Applying the End-of-Retail update",
             SetupStep::PatchClient => "Patching the game client",
+            SetupStep::InstallDecal => "Installing Decal",
             SetupStep::Finalize => "Finishing up",
         }
     }
@@ -153,6 +158,7 @@ impl SetupStep {
             SetupStep::InstallClient => "The original installer opens — you click through it",
             SetupStep::ApplyUpdates => "Copying the update files over the install",
             SetupStep::PatchClient => "Fixes for modern displays the client never expected",
+            SetupStep::InstallDecal => "The optional plugin framework, if you chose to install it",
             SetupStep::Finalize => "Last checks and a direct-launch shortcut",
         }
     }
@@ -169,7 +175,10 @@ impl SetupStep {
             SetupStep::Dependencies
             | SetupStep::DownloadRuntime
             | SetupStep::DownloadClient
-            | SetupStep::DownloadUpdates => None,
+            | SetupStep::DownloadUpdates
+            // Self-checks instead: it has to re-run when the Decal toggle changes,
+            // and it is a no-op once Decal is present.
+            | SetupStep::InstallDecal => None,
             SetupStep::InstallRuntime => Some("runtime"),
             SetupStep::Prefix => Some("prefix"),
             SetupStep::Components => Some("components"),
@@ -458,7 +467,7 @@ mod tests {
 
     #[test]
     fn every_step_has_a_label_and_the_order_is_fixed() {
-        assert_eq!(SetupStep::ALL.len(), 11);
+        assert_eq!(SetupStep::ALL.len(), 12);
         assert_eq!(SetupStep::ALL[0], SetupStep::Dependencies);
         assert_eq!(*SetupStep::ALL.last().unwrap(), SetupStep::Finalize);
         for s in SetupStep::ALL {
@@ -486,6 +495,9 @@ mod tests {
         let pos = |want: SetupStep| SetupStep::ALL.iter().position(|&s| s == want).unwrap();
         assert!(pos(SetupStep::ApplyUpdates) < pos(SetupStep::PatchClient));
         assert!(pos(SetupStep::PatchClient) < pos(SetupStep::Finalize));
+        // Decal is provisioned into a client that is already patched and in place.
+        assert!(pos(SetupStep::PatchClient) < pos(SetupStep::InstallDecal));
+        assert!(pos(SetupStep::InstallDecal) < pos(SetupStep::Finalize));
     }
 
     #[test]
