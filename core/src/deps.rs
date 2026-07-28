@@ -50,8 +50,27 @@ pub fn on_path(bin: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manager {
     pub name: &'static str,
-    /// The install verb, already including any non-interactive flags.
-    pub install: &'static [&'static str],
+    /// Refresh the package index first, where a stale one makes the install ask
+    /// the mirror for versions it no longer has and 404.
+    pub refresh: Option<&'static [&'static str]>,
+    /// The install verb, including any non-interactive flags when we run it
+    /// ourselves, and written to be correct to *show* either way.
+    pub command: &'static [&'static str],
+    /// May betterAC run this itself?
+    ///
+    /// False on Arch, and the reason is a rule rather than a preference: pacman
+    /// has no supported way to install one package without a full system upgrade.
+    /// `-S` alone resolves against a possibly-stale database and 404s; `-Sy pkg`
+    /// is the classic partial-upgrade footgun; `-Syu` is correct and means
+    /// upgrading the whole system — measured on Omarchy, adding umu-launcher and
+    /// gamescope wanted **78 packages, 1.7 GB, including an NVIDIA driver
+    /// update**. A game launcher should not do that to a machine unasked, so we
+    /// print the command and let the user run it.
+    ///
+    /// `--noconfirm` is also unsafe there: it silently answered a 14-way
+    /// `lib32-vulkan-driver` provider prompt with the default, which was the
+    /// NVIDIA stack — wrong on an AMD host.
+    pub unattended: bool,
     /// True for image-based distros where a package layered now only exists
     /// after a reboot, so setup cannot simply carry on.
     pub reboot_required: bool,
@@ -66,14 +85,50 @@ pub fn detect() -> Option<Manager> {
     const CANDIDATES: &[Manager] = &[
         Manager {
             name: "rpm-ostree",
-            install: &["rpm-ostree", "install", "--idempotent", "-y"],
+            refresh: None,
+            command: &["rpm-ostree", "install", "--idempotent", "-y"],
+            unattended: true,
             reboot_required: true,
         },
-        Manager { name: "pacman", install: &["pacman", "-S", "--needed", "--noconfirm"], reboot_required: false },
-        Manager { name: "dnf", install: &["dnf", "install", "-y"], reboot_required: false },
-        Manager { name: "apt-get", install: &["apt-get", "install", "-y"], reboot_required: false },
-        Manager { name: "zypper", install: &["zypper", "--non-interactive", "install"], reboot_required: false },
-        Manager { name: "xbps-install", install: &["xbps-install", "-Sy"], reboot_required: false },
+        // Shown, never run -- and shown as `-Syu`, the only correct form.
+        Manager {
+            name: "pacman",
+            refresh: None,
+            command: &["pacman", "-Syu", "--needed"],
+            unattended: false,
+            reboot_required: false,
+        },
+        Manager {
+            name: "dnf",
+            refresh: None,
+            command: &["dnf", "install", "-y"],
+            unattended: true,
+            reboot_required: false,
+        },
+        // A stale apt index 404s exactly like a stale pacman one; unlike Arch,
+        // refreshing it is not a partial upgrade, so we can just do it.
+        Manager {
+            name: "apt-get",
+            refresh: Some(&["apt-get", "update"]),
+            command: &["apt-get", "install", "-y"],
+            unattended: true,
+            reboot_required: false,
+        },
+        Manager {
+            name: "zypper",
+            refresh: None,
+            command: &["zypper", "--non-interactive", "install"],
+            unattended: true,
+            reboot_required: false,
+        },
+        // Void discourages partial updates for the same reason Arch does.
+        Manager {
+            name: "xbps-install",
+            refresh: None,
+            command: &["xbps-install", "-Su"],
+            unattended: false,
+            reboot_required: false,
+        },
     ];
     CANDIDATES.iter().find(|m| on_path(m.name)).cloned()
 }
@@ -131,14 +186,27 @@ fn is_root() -> bool {
 pub fn install_command(mgr: &Manager, packages: &[&str], escalate: Option<&str>) -> Vec<String> {
     escalate
         .into_iter()
-        .chain(mgr.install.iter().copied())
+        .chain(mgr.command.iter().copied())
         .map(String::from)
         .chain(packages.iter().map(|p| p.to_string()))
         .collect()
 }
 
 /// Install `packages`, returning the command's own complaint on failure.
+///
+/// Callers must check [`Manager::unattended`] first; this does not, so that the
+/// decision lives in one place rather than being re-derived here.
 pub fn install(mgr: &Manager, packages: &[&str]) -> Result<(), String> {
+    // Refresh first where a stale index is a known 404 source. Best-effort: if it
+    // fails the install below will produce the better error anyway.
+    if let Some(refresh) = mgr.refresh {
+        let argv = escalator()
+            .into_iter()
+            .chain(refresh.iter().copied())
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let _ = Command::new(&argv[0]).args(&argv[1..]).output();
+    }
     let argv = install_command(mgr, packages, escalator());
     let out = Command::new(&argv[0])
         .args(&argv[1..])
@@ -174,16 +242,30 @@ mod tests {
     }
     /// The table lookup without touching PATH, so the tests are hermetic.
     fn detect_named(name: &'static str) -> Option<Manager> {
-        const ALL: &[(&str, &[&str], bool)] = &[
-            ("rpm-ostree", &["rpm-ostree", "install", "--idempotent", "-y"], true),
-            ("pacman", &["pacman", "-S", "--needed", "--noconfirm"], false),
-            ("apt-get", &["apt-get", "install", "-y"], false),
+        const ALL: &[Manager] = &[
+            Manager {
+                name: "rpm-ostree",
+                refresh: None,
+                command: &["rpm-ostree", "install", "--idempotent", "-y"],
+                unattended: true,
+                reboot_required: true,
+            },
+            Manager {
+                name: "pacman",
+                refresh: None,
+                command: &["pacman", "-Syu", "--needed"],
+                unattended: false,
+                reboot_required: false,
+            },
+            Manager {
+                name: "apt-get",
+                refresh: Some(&["apt-get", "update"]),
+                command: &["apt-get", "install", "-y"],
+                unattended: true,
+                reboot_required: false,
+            },
         ];
-        ALL.iter().find(|(n, ..)| *n == name).map(|(n, i, r)| Manager {
-            name: n,
-            install: i,
-            reboot_required: *r,
-        })
+        ALL.iter().find(|m| m.name == name).cloned()
     }
 
     #[test]
@@ -219,13 +301,36 @@ mod tests {
 
     #[test]
     fn the_command_is_exactly_what_we_would_run() {
-        let c = install_command(&mgr("pacman"), &["umu-launcher", "gamescope"], Some("pkexec"));
-        assert_eq!(
-            c,
-            ["pkexec", "pacman", "-S", "--needed", "--noconfirm", "umu-launcher", "gamescope"]
-        );
+        let c = install_command(&mgr("apt-get"), &["gamescope"], Some("pkexec"));
+        assert_eq!(c, ["pkexec", "apt-get", "install", "-y", "gamescope"]);
         // Already root: no escalation prefix at all.
-        let c = install_command(&mgr("pacman"), &["gamescope"], None);
-        assert_eq!(c, ["pacman", "-S", "--needed", "--noconfirm", "gamescope"]);
+        assert_eq!(install_command(&mgr("apt-get"), &["gamescope"], None),
+                   ["apt-get", "install", "-y", "gamescope"]);
+    }
+
+    /// Arch is shown a command, never run one — and the command shown is `-Syu`.
+    ///
+    /// `-S` alone resolves against a stale database and 404s (measured on Omarchy);
+    /// `-Sy pkg` is a partial upgrade; `--noconfirm` silently answers provider
+    /// prompts, which picked the NVIDIA driver stack on that box.
+    #[test]
+    fn pacman_is_never_run_unattended_and_is_shown_the_full_upgrade() {
+        let pac = mgr("pacman");
+        assert!(!pac.unattended, "Arch has no supported single-package install");
+        let shown = install_command(&pac, &["umu-launcher", "gamescope"], Some("sudo"));
+        assert_eq!(shown, ["sudo", "pacman", "-Syu", "--needed", "umu-launcher", "gamescope"]);
+        assert!(!shown.contains(&"--noconfirm".to_string()), "must not answer provider prompts");
+
+        // The managers we do drive ourselves are the conventional ones.
+        assert!(mgr("apt-get").unattended);
+        assert!(mgr("rpm-ostree").unattended);
+    }
+
+    /// A stale apt index 404s the same way pacman's does; refreshing it first is
+    /// safe on Debian, so it is done rather than left to fail.
+    #[test]
+    fn apt_refreshes_its_index_first() {
+        assert_eq!(mgr("apt-get").refresh, Some(["apt-get", "update"].as_slice()));
+        assert_eq!(mgr("pacman").refresh, None, "refreshing Arch alone is the footgun");
     }
 }

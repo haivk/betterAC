@@ -325,89 +325,79 @@ impl ProtonRuntime {
             return Ok(());
         }
 
-        let names = |ts: &[deps::Tool]| {
-            ts.iter().map(|t| t.bin).collect::<Vec<_>>().join(", ")
-        };
+        let mgr = deps::detect();
+        let opted_out = std::env::var("BETTERAC_NO_DEPS").is_ok_and(|v| v == "1");
+        let packages: Vec<&str> = mgr
+            .as_ref()
+            .map(|m| missing.iter().filter_map(|t| deps::package(m, *t)).collect())
+            .unwrap_or_default();
 
-        if std::env::var("BETTERAC_NO_DEPS").is_ok_and(|v| v == "1") {
-            return Err(manual_instructions(&missing, "BETTERAC_NO_DEPS=1 is set"));
-        }
-
-        match deps::detect() {
-            None => Err(manual_instructions(&missing, "no supported package manager was found")),
-            Some(mgr) => {
-                // Only what this distro actually packages; the rest is explained.
-                let packages: Vec<&str> =
-                    missing.iter().filter_map(|t| deps::package(&mgr, *t)).collect();
-                if packages.is_empty() {
-                    return Err(manual_instructions(&missing, "your distro does not package them"));
-                }
-
+        // Install only where the distro supports installing one package without
+        // dragging the whole system with it -- see `deps::Manager::unattended`.
+        let mut attempt: Option<Result<(), String>> = None;
+        if let Some(m) = &mgr {
+            if m.unattended && !opted_out && !packages.is_empty() {
                 on(Progress::new(
                     SetupStep::Dependencies,
                     0.3,
-                    format!("installing {} with {} (you may be asked for your password)…", packages.join(" and "), mgr.name),
+                    format!(
+                        "installing {} with {} (you may be asked for your password)…",
+                        packages.join(" and "),
+                        m.name
+                    ),
                 ));
-                let attempt = deps::install(&mgr, &packages);
-
+                let r = deps::install(m, &packages);
                 // An image-based host layers the package into the *next* boot, so
                 // even a successful install leaves this one unable to continue.
-                if attempt.is_ok() && mgr.reboot_required {
+                if r.is_ok() && m.reboot_required {
                     return Err(format!(
                         "Installed {} — reboot to finish, then run setup again.\n\n  \
                          systemctl reboot",
                         packages.join(" and ")
                     ));
                 }
-                // Believe the filesystem, not the exit code -- and judge by what is
-                // still missing, not by whether the installer was happy. A failure
-                // that leaves only *optional* tools absent is not a failed setup:
-                // gamescope is a nicety, and refusing to install the game because
-                // the host could not supply it would be absurd.
-                let still: Vec<deps::Tool> =
-                    missing.iter().copied().filter(|t| !deps::on_path(t.bin)).collect();
-
-                if still.iter().any(|t| t.required) {
-                    let why = match &attempt {
-                        Err(e) => format!("could not install them: {e}"),
-                        Ok(()) => "the install reported success but they are still missing".into(),
-                    };
-                    // pacman's "target not found" for umu-launcher is almost always
-                    // multilib being disabled. Only say so when umu-launcher was
-                    // actually one of the packages -- the same error about gamescope
-                    // means something else entirely.
-                    let multilib = matches!(&attempt, Err(e)
-                        if mgr.name == "pacman"
-                            && e.contains("target not found")
-                            && packages.contains(&"umu-launcher"));
-                    let hint = if multilib {
-                        "\n       umu-launcher lives in the multilib repository. Enable it by \
-                         uncommenting\n       the [multilib] section in /etc/pacman.conf, then run: \
-                         sudo pacman -Sy\n"
-                    } else {
-                        ""
-                    };
-                    return Err(format!("{}{hint}", manual_instructions(&still, &why)));
-                }
-                if still.is_empty() {
-                    on(Progress::new(
-                        SetupStep::Dependencies,
-                        1.0,
-                        format!("installed {}", packages.join(" and ")),
-                    ));
-                } else {
-                    on(Progress::new(
-                        SetupStep::Dependencies,
-                        1.0,
-                        format!(
-                            "continuing without {} — optional; the game runs, just without its scaling",
-                            names(&still)
-                        ),
-                    ));
-                }
-                Ok(())
+                attempt = Some(r);
             }
         }
+
+        // One verdict for every route in: judged on what is still missing, never on
+        // an installer's exit code, and only *required* tools can fail the step.
+        let still: Vec<deps::Tool> =
+            missing.iter().copied().filter(|t| !deps::on_path(t.bin)).collect();
+
+        if still.iter().any(|t| t.required) {
+            let why = match (&attempt, opted_out, &mgr) {
+                (Some(Err(e)), ..) => format!("could not install them: {e}"),
+                (Some(Ok(())), ..) => "the install reported success but they are still missing".into(),
+                (None, true, _) => "BETTERAC_NO_DEPS=1 is set".into(),
+                (None, _, None) => "no supported package manager was found".into(),
+                (None, _, Some(m)) if !m.unattended => {
+                    format!("{} cannot install one package without upgrading the system", m.name)
+                }
+                (None, ..) => "your distro does not package them".into(),
+            };
+            return Err(manual_instructions(&still, &why));
+        }
+
+        if still.is_empty() {
+            if attempt.is_some() {
+                on(Progress::new(
+                    SetupStep::Dependencies,
+                    1.0,
+                    format!("installed {}", packages.join(" and ")),
+                ));
+            }
+        } else {
+            // Only optional tools are absent. Say so and carry on -- refusing to
+            // install a game because gamescope is missing would be absurd.
+            let names = still.iter().map(|t| t.bin).collect::<Vec<_>>().join(", ");
+            on(Progress::new(
+                SetupStep::Dependencies,
+                1.0,
+                format!("continuing without {names} — optional; the game runs, just without its scaling"),
+            ));
+        }
+        Ok(())
     }
 
     fn step_download_runtime(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
@@ -784,6 +774,13 @@ fn manual_instructions(missing: &[crate::deps::Tool], why: &str) -> String {
                 "\n       Install with:\n         {}\n",
                 deps::install_command(mgr, &pkgs, deps::escalator()).join(" ")
             ));
+            if !mgr.unattended {
+                msg.push_str(
+                    "\n       That upgrades the whole system, which is why betterAC does not run\n       \
+                     it for you: on this distro there is no supported way to install a\n       \
+                     single package on its own.\n",
+                );
+            }
         }
     }
     // The "get it from upstream" pointer belongs only to tools this distro really
