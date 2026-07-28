@@ -160,14 +160,19 @@ pub(crate) fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), Strin
 /// drag an OpenSSL build dependency into every Linux build for the sake of one
 /// server, so we try the good path first and shell out only when it fails. If Decal ever modernises its TLS this fallback quietly stops being used.
 pub(crate) fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let direct = ureq::get(url).set("User-Agent", "betterac").call().and_then(|r| {
+    // Errors are flattened to String as they happen rather than carried as
+    // `ureq::Error`: that type is 272 bytes, and a Result carrying it is large
+    // enough that clippy's `result_large_err` rejects it outright.
+    let direct = (|| -> Result<Vec<u8>, String> {
+        let resp = ureq::get(url).set("User-Agent", "betterac").call().map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut r.into_reader(), &mut bytes)
-            .map_err(|e| ureq::Error::from(std::io::Error::other(e)))?;
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes)
+            .map_err(|e| e.to_string())?;
         Ok(bytes)
-    });
-    let Err(e) = direct else {
-        return direct.map_err(|e| e.to_string());
+    })();
+    let e = match direct {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
     };
     let out = std::process::Command::new("curl")
         .args(["-sSL", "--max-time", "60", "--fail", url])

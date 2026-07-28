@@ -1834,7 +1834,7 @@ fn parse_plugin_query(text: &str) -> Vec<ParsedPlugin> {
         }
     }
     flush(&mut current, &mut out);
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|p| p.name.to_lowercase());
     out
 }
 
