@@ -51,6 +51,24 @@ The tap is this repository — the URL is spelled out because Homebrew's short f
 one. `--cask` matters too: without it Homebrew looks for a formula by that name and
 fails.
 
+### Upgrading from an older install
+
+betterAC has been installed three different ways over its life — an early setup script, a
+Flatpak, and the current tarball — and each put its files somewhere else. If you have one of
+the older ones, clear it out first:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/haivk/betterAC/main/cleanup-legacy.sh | bash
+```
+
+It finds all three, **shows you exactly what it found and what it removed**, and asks before
+deleting anything. It deliberately leaves alone anything belonging to another program (a
+Lutris or Steam entry for the same game), and leaves shared downloads — the winetricks cache,
+umu's runtime, GE-Proton in Steam's tools — unless you pass `--deep`. `--dry-run` lists
+without touching anything.
+
+Then run the installer above.
+
 There is no `.deb`, AUR package or Flatpak, on purpose. betterAC drives `umu-run` on the
 host, which Debian and Ubuntu do not package at all and a Flatpak cannot reach — its
 sandbox kills the game client outright. The one-liner is the supported Linux path.
