@@ -10,12 +10,13 @@
 #   ./packaging/render-metadata.sh dist/           # after building artifacts
 #
 # Writes into <dir>:
-#   betterac.rb          Homebrew cask (macOS)  -> homebrew-betterac tap, Casks/
-#   betterac-formula.rb  Homebrew formula (Linux) -> same tap, Formula/betterac.rb
-#   PKGBUILD           AUR (-bin)      -> aur.archlinux.org/betterac-bin.git
-#   .SRCINFO           AUR metadata    -> same repo, generated not hand-edited
-#   ac.betterac.BetterAC.metainfo.xml  AppStream, version + date filled in
-#   SHA256SUMS         every artifact, for the release body
+#   betterac.rb   Homebrew cask (macOS) -> homebrew-betterac tap, Casks/
+#   SHA256SUMS    every artifact -- the release body, and what install.sh verifies
+#                 downloads against *and* reads the artifact names out of
+#
+# Homebrew (macOS) is the only package manager left. The AUR package, the Flatpak,
+# the .deb and the Linux brew formula were dropped in favour of the one-line
+# installer -- Linux installs the tarball into ~/.local via install.sh.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,10 +43,6 @@ else
 fi
 
 DMG="$DIST/BetterAC-${VERSION}-universal.dmg"
-TARBALL="$DIST/betterac-${VERSION}-x86_64.tar.gz"
-# The Linux formula builds from source, so it checksums this rather than the
-# binary tarball. Produced by packaging/source-tarball.sh.
-SRC="$DIST/betterac-${VERSION}-src.tar.gz"
 
 # sha256 of a file, portable between the macOS and Linux runners.
 sha256() {
@@ -58,65 +55,26 @@ sha256() {
 
 say "Rendering metadata for $VERSION ($DATE)"
 
-DMG_SHA="$(sha256 "$DMG")"
-TARBALL_SHA="$(sha256 "$TARBALL")"
-SRC_SHA="$(sha256 "$SRC")"
-
-fill() {
+# The cask is rendered only when a DMG is actually here. It is skipped on a
+# release built without the Apple signing secrets: that path deliberately keeps
+# the unsigned DMG out of the release (Gatekeeper would refuse to open it), so
+# there is nothing for a cask to point at and publishing one would be a lie.
+if [ -f "$DMG" ]; then
+  DMG_SHA="$(sha256 "$DMG")"
   sed -e "s|@@VERSION@@|$VERSION|g" \
       -e "s|@@DATE@@|$DATE|g" \
       -e "s|@@DMG_SHA256@@|$DMG_SHA|g" \
-      -e "s|@@TARBALL_SHA256@@|$TARBALL_SHA|g" \
-      -e "s|@@SRC_SHA256@@|$SRC_SHA|g" \
-      "$1" > "$2"
-  printf "    %s\n" "$2"
-}
-
-fill "$ROOT/packaging/homebrew/betterac.rb.in" "$DIST/betterac.rb"
-# Not betterac.rb: the cask already owns that name here. They only stop
-# colliding once they are in the tap, under Casks/ and Formula/.
-fill "$ROOT/packaging/homebrew/betterac-formula.rb.in" "$DIST/betterac-formula.rb"
-fill "$ROOT/packaging/aur/PKGBUILD.in"         "$DIST/PKGBUILD"
-fill "$ROOT/packaging/shared/ac.betterac.BetterAC.metainfo.xml" \
-     "$DIST/ac.betterac.BetterAC.metainfo.xml"
-
-# .SRCINFO is mechanically derived from the PKGBUILD. makepkg --printsrcinfo is
-# the source of truth when it is available (an Arch box); everywhere else, write
-# the equivalent by hand from the same values so CI on Ubuntu still produces a
-# valid file.
-say "Generating .SRCINFO"
-if command -v makepkg >/dev/null; then
-  (cd "$DIST" && makepkg --printsrcinfo > .SRCINFO)
-  printf "    %s (via makepkg)\n" "$DIST/.SRCINFO"
+      "$ROOT/packaging/homebrew/betterac.rb.in" > "$DIST/betterac.rb"
+  printf "    %s\n" "$DIST/betterac.rb"
 else
-  cat > "$DIST/.SRCINFO" <<EOF
-pkgbase = betterac-bin
-	pkgdesc = Launcher for Asheron's Call player servers
-	pkgver = $VERSION
-	pkgrel = 1
-	url = https://github.com/haivk/betterAC
-	arch = x86_64
-	license = MIT
-	depends = gtk4
-	depends = libadwaita
-	optdepends = umu-launcher: required to launch the game
-	optdepends = gamescope: correct fullscreen scaling (strongly recommended)
-	optdepends = winetricks: installs the runtime components the client needs
-	provides = betterac
-	conflicts = betterac
-	source = betterac-bin-$VERSION.tar.gz::https://github.com/haivk/betterAC/releases/download/v$VERSION/betterac-$VERSION-x86_64.tar.gz
-	sha256sums = $TARBALL_SHA
-
-pkgname = betterac-bin
-EOF
-  printf "    %s (hand-rolled; no makepkg on this host)\n" "$DIST/.SRCINFO"
+  printf "    no DMG in %s -- skipping the Homebrew cask\n" "$DIST"
 fi
 
 say "Checksums"
 (
   cd "$DIST"
   # Only the shipped artifacts, not the metadata we just wrote.
-  files=$(ls -1 *.dmg *.tar.gz *.deb *.flatpak 2>/dev/null || true)
+  files=$(ls -1 *.dmg *.tar.gz 2>/dev/null || true)
   [ -n "$files" ] || die "no artifacts found in $DIST"
   if command -v sha256sum >/dev/null; then sha256sum $files > SHA256SUMS
   else shasum -a 256 $files > SHA256SUMS; fi

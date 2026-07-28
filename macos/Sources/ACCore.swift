@@ -89,6 +89,21 @@ enum ACCore {
     @discardableResult
     static func openDecalSettings() -> String? { take(ac_decal_open_settings()) }
 
+    /// What is running, what is available, and who owns updating this copy.
+    ///
+    /// Makes a network request — never call it on the main thread.
+    static func updateStatus() -> UpdateStatus? {
+        guard let json = take(ac_update_status()) else { return nil }
+        return decode(UpdateStatus.self, from: json)
+    }
+
+    /// Download and install the newest release. Blocking and slow; off the main
+    /// thread only.
+    static func installUpdate() -> UpdateResult? {
+        guard let json = take(ac_update_install()) else { return nil }
+        return decode(UpdateResult.self, from: json)
+    }
+
     /// Shut the prefix down. Decal's agent outlives the settings sheet on purpose,
     /// so something has to end it or its menu-bar icon is left behind.
     static func shutdownPrefix() { ac_decal_shutdown() }

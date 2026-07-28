@@ -25,9 +25,11 @@ NOTARIZE="${NOTARIZE:-0}"
 say() { printf "\n==> %s\n" "$*"; }
 die() { printf "\nerror: %s\n" "$*" >&2; exit 1; }
 
-# The version is the workspace version, single-sourced from Cargo.toml.
-VERSION="$(cd "$ROOT" && cargo metadata --no-deps --format-version 1 \
-  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="betterac"))')"
+# Releases are dated, not semver: CI passes VERSION=YYYY.MM.DD.<build>, which is
+# four components and so cannot live in Cargo.toml (crate versions must be semver
+# X.Y.Z). The workspace version is only the fallback, for a local build.
+VERSION="${VERSION:-$(cd "$ROOT" && cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="betterac"))')}"
 APP_NAME="BetterAC"
 DMG="$DIST/${APP_NAME}-${VERSION}-universal.dmg"
 

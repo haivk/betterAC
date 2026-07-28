@@ -30,6 +30,12 @@ struct SettingsView: View {
     @State private var resetting = false
     @State private var error: String?
 
+    /// Nil until the update check answers; it is a network round trip, so the
+    /// section shows a placeholder rather than making the sheet wait on GitHub.
+    @State private var update: UpdateStatus?
+    @State private var updating = false
+    @State private var updateError: String?
+
     @State private var decalEnabled = false
     @State private var decalInstalled = false
     @State private var plugins: [DecalPlugin] = []
@@ -58,6 +64,7 @@ struct SettingsView: View {
                 Section("About") {
                     LabeledContent("BetterAC", value: appVersion)
                     LabeledContent("Core", value: ACCore.coreVersion)
+                    updateRow
                 }
 
                 Section {
@@ -217,7 +224,11 @@ struct SettingsView: View {
             // Cheap (config + disk paths), so the sheet is usable immediately.
             targets = ACCore.resetTargets()
             decalEnabled = ACCore.loadConfig().decal.enabled
-            await refreshDecal()
+            // Two independent network/prefix reads; neither should wait on the
+            // other, and neither blocks the sheet from being usable.
+            async let decal: Void = refreshDecal()
+            async let updates: Void = refreshUpdate()
+            _ = await (decal, updates)
         }
         // Coming back from Decal's agent is exactly when the list is most likely to
         // be wrong — the user went there to change something. Re-reading on
@@ -245,6 +256,84 @@ struct SettingsView: View {
     /// Off the main thread, always: this spawns `reg query` inside the prefix and a
     /// cold wineserver makes that a 5–10 second call. Doing it inline is what used
     /// to freeze the whole settings sheet until Decal had answered.
+    /// The updater's one row: checking, up to date, or an offer to install.
+    ///
+    /// A Homebrew-installed copy is told to use `brew upgrade` instead of being
+    /// offered a button. Replacing it ourselves would leave Homebrew's receipt
+    /// describing a version that is no longer on disk.
+    @ViewBuilder
+    private var updateRow: some View {
+        if updating {
+            HStack {
+                Text("Downloading update…")
+                Spacer()
+                ProgressView().controlSize(.small)
+            }
+        } else if let updateError {
+            Label(updateError, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        } else if let update {
+            if let error = update.error {
+                Label("Could not check for updates: \(error)", systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let release = update.available {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Update available: \(release.version)")
+                        if update.source == "homebrew" {
+                            Text("Installed by Homebrew — run: brew upgrade --cask betterac")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if update.source != "homebrew" {
+                        Button("Install") { installUpdate() }
+                    }
+                }
+            } else {
+                Text("Up to date").foregroundStyle(.secondary)
+            }
+        } else {
+            HStack {
+                Text("Checking for updates…").foregroundStyle(.secondary)
+                Spacer()
+                ProgressView().controlSize(.small)
+            }
+        }
+    }
+
+    private func refreshUpdate() async {
+        update = await Task.detached { ACCore.updateStatus() }.value
+    }
+
+    /// Install the newest release.
+    ///
+    /// On success the core has staged a helper that is *waiting for this process to
+    /// exit* before it can swap the bundle — an app cannot replace itself while it
+    /// is running. So when it says quit, we quit; the helper relaunches the new
+    /// version. Anything else means the update is already in place and a restart is
+    /// merely due.
+    private func installUpdate() {
+        updateError = nil
+        updating = true
+        Task {
+            let result = await Task.detached { ACCore.installUpdate() }.value
+            updating = false
+            if let error = result?.error {
+                updateError = error
+                return
+            }
+            if result?.quit == true {
+                NSApp.terminate(nil)
+            } else {
+                await refreshUpdate()
+            }
+        }
+    }
+
     private func refreshDecal() async {
         let state = await Task.detached { ACCore.decalState() }.value
         decalInstalled = state.installed

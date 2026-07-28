@@ -218,7 +218,7 @@ impl MsiSource {
         // so this needs the curl fallback. The MSI is ~2 MB, so buffering it in
         // memory costs nothing and a progress bar would barely flicker.
         on(Progress::new(SetupStep::InstallDecal, 0.2, "downloading Decal…"));
-        let bytes = fetch_small(&self.url).map_err(|e| format!("downloading Decal: {e}"))?;
+        let bytes = crate::fetch::get_bytes(&self.url).map_err(|e| format!("downloading Decal: {e}"))?;
         std::fs::write(&dest, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
         if let Some(expected) = &self.sha256 {
             if let Err(e) = crate::fetch::verify_sha256(&dest, expected) {
@@ -1684,43 +1684,14 @@ fn seed_data_files(prefix: &Path) -> Result<(), String> {
     let dir = install_dir(prefix);
     for name in DATA_FILES {
         let url = format!("https://decaldev.com/updatelist/{name}.xml?a");
-        let bytes = fetch_small(&url).map_err(|e| format!("fetching {name}.xml: {e}"))?;
+        let bytes = crate::fetch::get_bytes(&url).map_err(|e| format!("fetching {name}.xml: {e}"))?;
         let dest = dir.join(format!("{name}.xml"));
         std::fs::write(&dest, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
     }
     Ok(())
 }
 
-/// Fetch a small file, preferring our own HTTP client and falling back to the
-/// system `curl`.
-///
-/// The fallback is not paranoia. Measured 2026-07-24: every decaldev.com host
-/// negotiates **only CBC cipher suites** (`ECDHE-RSA-AES256-SHA384`) and offers no
-/// TLS 1.3, while rustls — which `ureq`'s `tls` feature uses — implements only AEAD
-/// suites. The handshake therefore cannot complete, ever, and plain HTTP is a 301
-/// to HTTPS on all three hostnames. Switching the whole crate to `native-tls` would
-/// drag an OpenSSL build dependency into the Linux, Flatpak and AUR packaging for
-/// the sake of one server, so we try the good path first and shell out only when it
-/// fails. If Decal ever modernises its TLS this fallback quietly stops being used.
-fn fetch_small(url: &str) -> Result<Vec<u8>, String> {
-    let direct = ureq::get(url).set("User-Agent", "betterac").call().and_then(|r| {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut r.into_reader(), &mut bytes)
-            .map_err(|e| ureq::Error::from(std::io::Error::other(e)))?;
-        Ok(bytes)
-    });
-    let Err(e) = direct else {
-        return direct.map_err(|e| e.to_string());
-    };
-    let out = std::process::Command::new("curl")
-        .args(["-sSL", "--max-time", "60", "--fail", url])
-        .output()
-        .map_err(|_| format!("{e} (and curl is not available to fall back on)"))?;
-    if out.status.success() && !out.stdout.is_empty() {
-        return Ok(out.stdout);
-    }
-    Err(format!("{e}; curl also failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
-}
+
 
 /// Fill the two paths into the generated template. They arrive already
 /// `.reg`-escaped, because every other backslash in the template is escaped too.

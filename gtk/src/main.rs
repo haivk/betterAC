@@ -26,7 +26,11 @@ fn main() -> gtk::glib::ExitCode {
     // block runs this: it is the only flag that is safe to run unattended --
     // --setup would start downloading gigabytes.
     if args.iter().any(|a| a == "--version") {
-        println!("betterac {}", env!("CARGO_PKG_VERSION"));
+        // `ac_core::VERSION`, not this crate's: released builds are dated and the
+        // real version is baked into core at compile time. This is what
+        // `install.sh` prints when it proves the binary runs, so it has to be the
+        // version people are actually installing.
+        println!("betterac {}", ac_core::VERSION);
         std::process::exit(0);
     }
 

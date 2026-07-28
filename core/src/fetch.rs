@@ -148,3 +148,38 @@ pub(crate) fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), Strin
         ))
     }
 }
+
+/// Fetch a small file, preferring our own HTTP client and falling back to the
+/// system `curl`.
+///
+/// The fallback is not paranoia. Measured 2026-07-24: every decaldev.com host
+/// negotiates **only CBC cipher suites** (`ECDHE-RSA-AES256-SHA384`) and offers no
+/// TLS 1.3, while rustls — which `ureq`'s `tls` feature uses — implements only AEAD
+/// suites. The handshake therefore cannot complete, ever, and plain HTTP is a 301
+/// to HTTPS on all three hostnames. Switching the whole crate to `native-tls` would
+/// drag an OpenSSL build dependency into every Linux build for the sake of one
+/// server, so we try the good path first and shell out only when it fails. If Decal ever modernises its TLS this fallback quietly stops being used.
+pub(crate) fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let direct = ureq::get(url).set("User-Agent", "betterac").call().and_then(|r| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut r.into_reader(), &mut bytes)
+            .map_err(|e| ureq::Error::from(std::io::Error::other(e)))?;
+        Ok(bytes)
+    });
+    let Err(e) = direct else {
+        return direct.map_err(|e| e.to_string());
+    };
+    let out = std::process::Command::new("curl")
+        .args(["-sSL", "--max-time", "60", "--fail", url])
+        .output()
+        .map_err(|_| format!("{e} (and curl is not available to fall back on)"))?;
+    if out.status.success() && !out.stdout.is_empty() {
+        return Ok(out.stdout);
+    }
+    Err(format!("{e}; curl also failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+}
+
+/// The same, as text — for small published metadata such as `SHA256SUMS`.
+pub(crate) fn get_string(url: &str) -> Result<String, String> {
+    String::from_utf8(get_bytes(url)?).map_err(|e| format!("{url}: not valid UTF-8 ({e})"))
+}

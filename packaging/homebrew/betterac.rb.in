@@ -1,13 +1,16 @@
 # Homebrew cask for betterAC. Rendered by packaging/render-metadata.sh, which
 # fills in the version and the DMG's SHA-256 from the release being built.
 #
-# This goes in a personal tap, not homebrew-cask: upstream has notability
-# requirements (stars/forks/age) that a fresh repo will not meet. Create the tap
-# once, as a GitHub repo named `homebrew-betterac`, then:
+# The tap is the betterAC repository itself: the rendered file is committed to
+# Casks/betterac.rb by the release workflow, so there is no second repo and no
+# manual copy. Users tap it by URL, because Homebrew's short form would look for a
+# repo named `homebrew-betterac`:
 #
-#   cp betterac.rb <tap>/Casks/betterac.rb   # this file, rendered
-#   brew tap haivk/betterac
+#   brew tap haivk/betterac https://github.com/haivk/betterAC
 #   brew install --cask betterac
+#
+# A personal tap rather than homebrew-cask: upstream has notability requirements
+# (stars/forks/age) that a fresh repo will not meet.
 #
 # No `--no-quarantine` anywhere on purpose: the DMG is signed with a Developer ID
 # and notarized, so Gatekeeper lets it open normally. If you ever ship an

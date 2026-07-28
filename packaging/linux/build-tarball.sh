@@ -29,8 +29,11 @@ DIST="$ROOT/dist"
 say() { printf "\n==> %s\n" "$*"; }
 die() { printf "\nerror: %s\n" "$*" >&2; exit 1; }
 
-VERSION="$(cd "$ROOT" && cargo metadata --no-deps --format-version 1 \
-  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="betterac"))')"
+# Releases are dated, not semver: CI passes VERSION=YYYY.MM.DD.<build>, which is
+# four components and so cannot live in Cargo.toml (crate versions must be semver
+# X.Y.Z). The workspace version is only the fallback, for a local build.
+VERSION="${VERSION:-$(cd "$ROOT" && cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="betterac"))')}"
 ARCH="$(uname -m)"
 NAME="betterac-${VERSION}-${ARCH}"
 
@@ -53,13 +56,10 @@ mkdir -p "$PKG/data"
 install -m755 "$ROOT/target/release/betterac" "$PKG/betterac"
 install -m644 "$ROOT/gtk/data/betterac.desktop" "$PKG/data/betterac.desktop"
 install -m644 "$ROOT/gtk/data/betterac.svg" "$PKG/data/betterac.svg"
-# Rendered, not copied: the shared file is a template and would otherwise ship
-# a literal @@VERSION@@ to /usr/share/metainfo. Also written to dist/ because
-# `cargo deb` installs it from there -- see [package.metadata.deb] assets.
-VERSION="$VERSION" "$ROOT/packaging/render-metainfo.sh" \
-  "$PKG/data/ac.betterac.BetterAC.metainfo.xml"
-VERSION="$VERSION" "$ROOT/packaging/render-metainfo.sh" \
-  "$ROOT/dist/ac.betterac.BetterAC.metainfo.xml"
+# No AppStream metainfo here any more. It only ever mattered to the .deb, the AUR
+# package and the Flatpak -- all dropped -- because gtk/install.sh installs the
+# .desktop file and the icon but never installed the metainfo, and nothing else
+# reads it outside a software centre we are not listed in.
 install -m755 "$ROOT/gtk/install.sh" "$PKG/install.sh"
 install -m644 "$ROOT/README.md" "$PKG/README.md"
 install -m644 "$ROOT/LICENSE" "$PKG/LICENSE"

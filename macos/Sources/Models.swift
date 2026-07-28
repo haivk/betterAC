@@ -167,3 +167,30 @@ struct SetupRun: Codable {
     /// thing happening now is always the row at the top.
     var remaining: [SetupStepStatus] { steps.filter { !$0.state.isFinished } }
 }
+
+/// A release newer than this build — mirrors `ac_core::update::Release`.
+struct UpdateRelease: Codable {
+    var version: String
+    var asset: String
+    var sha256: String
+}
+
+/// Mirrors `ac_core::update::Status`, plus the `error` key the FFI substitutes
+/// when the check could not be made at all.
+struct UpdateStatus: Codable {
+    var current: String
+    var available: UpdateRelease?
+    /// `"homebrew"` when this copy must be updated with `brew upgrade` rather than
+    /// by replacing it ourselves. Absent when the check failed.
+    var source: String?
+    var error: String?
+}
+
+/// The outcome of `ac_update_install`.
+struct UpdateResult: Codable {
+    /// The app must exit *now* — a helper is waiting to swap the bundle, and it
+    /// cannot proceed while this process holds it open.
+    var quit: Bool?
+    var uptodate: Bool?
+    var error: String?
+}

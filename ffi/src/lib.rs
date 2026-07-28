@@ -427,6 +427,46 @@ pub extern "C" fn ac_decal_shutdown() {
     }
 }
 
+// ------------------------------------------------------------------------ updates
+
+/// What is running, what is available, and who owns updating this copy — as
+/// `ac_core::update::Status` JSON. On failure the JSON carries an `error` key
+/// instead, because being unable to reach GitHub is not a reason for the settings
+/// panel to show nothing.
+///
+/// This makes a network request; call it off the main thread.
+#[no_mangle]
+pub extern "C" fn ac_update_status() -> *mut c_char {
+    match ac_core::update::status() {
+        Ok(s) => to_c(serde_json::to_string(&s).unwrap_or_else(|_| "{}".into())),
+        Err(e) => to_c(
+            serde_json::json!({ "current": ac_core::VERSION, "error": e }).to_string(),
+        ),
+    }
+}
+
+/// Download and install the newest release. Blocking and slow — call it off the
+/// main thread.
+///
+/// Returns JSON: `{"quit":true}` when the app must exit *now* for a helper to swap
+/// the bundle, `{"quit":false}` when the new version is already on disk and will be
+/// picked up on the next launch, `{"uptodate":true}` when there was nothing to do,
+/// or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn ac_update_install() -> *mut c_char {
+    use ac_core::update::Applied;
+    let result = ac_core::update::update_now(&mut |_| {});
+    to_c(
+        match result {
+            Ok(None) => serde_json::json!({ "uptodate": true }),
+            Ok(Some(Applied::QuitNow)) => serde_json::json!({ "quit": true }),
+            Ok(Some(Applied::RestartWhenReady)) => serde_json::json!({ "quit": false }),
+            Err(e) => serde_json::json!({ "error": e }),
+        }
+        .to_string(),
+    )
+}
+
 /// Free a string returned by any of the `*_json` / `*_get` / `ac_detect` /
 /// `ac_setup_poll` / `ac_config_set` / `ac_launch` calls. Null is ignored. Never
 /// call this on `ac_core_version`'s result.

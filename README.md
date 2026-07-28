@@ -17,40 +17,43 @@ under Wine except the game itself. The whole class of problem goes away.
 
 ## Install
 
-**Linux — one line, any distro:**
+**One line, Linux or macOS:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/haivk/betterAC/main/install.sh | bash
 ```
 
-Downloads the latest release, checks it against the published `SHA256SUMS`, proves the
-binary actually runs on your machine, then installs to `~/.local` — binary, `.desktop`
-entry, icon. No root, no sandbox, no compiler. This is the recommended path on Bazzite
-and other atomic distros, where there is no host compiler and betterAC has to run on
-the host anyway.
+Finds the newest release, checks the download against the published `SHA256SUMS`, and
+installs it — on Linux the tarball into `~/.local` (binary, `.desktop` entry, icon; no
+root, no sandbox, no compiler), on macOS the signed and notarized app into
+`/Applications`.
 
-If your toolkit is too old (it needs glibc ≥ 2.39, gtk4 ≥ 4.12, libadwaita ≥ 1.5) the
-script says so before installing anything, rather than leaving you with a binary that
-will not start.
+Linux is the recommended path on Bazzite and other atomic distros, where there is no
+host compiler and betterAC has to run on the host anyway. Before installing anything it
+runs the binary to prove it works here, so a too-old toolkit (glibc ≥ 2.39, gtk4 ≥ 4.12,
+libadwaita ≥ 1.5) is reported up front rather than leaving you with something that will
+not start.
 
-**macOS, and Linux via Homebrew:**
+Every commit to `main` is released, versioned by date — `2026.07.27.42` — so the newest
+release is simply the newest build. Add `BETTERAC_VERSION=2026.07.27.42` to install an
+exact one instead.
+
+**macOS via Homebrew** — the nicer path if you have it, since it handles upgrades and
+uninstall:
 
 ```sh
-brew tap haivk/betterac
-
-brew install --cask betterac   # macOS: the signed, notarized app
-brew install betterac          # Linux: builds from source against brew's gtk4
+brew tap haivk/betterac https://github.com/haivk/betterAC
+brew install --cask betterac
 ```
 
-`--cask` is required on macOS. Homebrew resolves a formula before a same-named
-cask, so a bare `brew install betterac` on a Mac finds the Linux formula and stops
-with `Error: betterac: Linux is required.` On Linux the formula is mainly useful when
-your distro's gtk4 is older than 4.12 — it brings its own toolkit, at the cost of
-several hundred MB of bottles. Where the one-liner above works, prefer it.
+The tap is this repository — the URL is spelled out because Homebrew's short form
+(`brew tap haivk/betterac`) assumes a repo named `homebrew-betterac`, and there isn't
+one. `--cask` matters too: without it Homebrew looks for a formula by that name and
+fails.
 
-Linux also has a `.deb`, an AUR package (`yay -S betterac-bin`) and a plain tarball
-on the [releases page](https://github.com/haivk/betterAC/releases). All of them need
-`umu-launcher`, which is not in Homebrew or Debian — see `packaging/README.md`.
+There is no `.deb`, AUR package or Flatpak, on purpose. betterAC drives `umu-run` on the
+host, which Debian and Ubuntu do not package at all and a Flatpak cannot reach — its
+sandbox kills the game client outright. The one-liner is the supported Linux path.
 
 ### From this repo
 

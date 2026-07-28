@@ -676,14 +676,7 @@ impl App {
 
         let page = adw::PreferencesPage::new();
 
-        let about = adw::PreferencesGroup::builder().title("About").build();
-        let version = adw::ActionRow::builder()
-            .title("betterAC")
-            .subtitle(env!("CARGO_PKG_VERSION"))
-            .build();
-        version.add_css_class("property");
-        about.add(&version);
-        page.add(&about);
+        self.clone().add_about_group(&page);
 
         self.clone().add_decal_groups(&page, &win);
 
@@ -719,6 +712,110 @@ impl App {
         let ui = self.clone();
         let parent = win.clone();
         btn.connect_clicked(move |_| ui.clone().confirm_reset(&parent));
+    }
+
+    /// About, and the updater.
+    ///
+    /// The version shown is `ac_core::VERSION` rather than this crate's: released
+    /// builds are dated and carry the real version, and showing `0.1.0` next to an
+    /// offer to update to `2026.07.27.42` would be nonsense.
+    ///
+    /// The check is a network round trip, so it happens **off the main thread** and
+    /// the row fills in when it answers — the settings window must never wait on
+    /// GitHub to appear. Failing to reach it is reported in the row and nowhere
+    /// else: not being able to check for updates is not an error worth a dialog.
+    fn add_about_group(self: Rc<Self>, page: &adw::PreferencesPage) {
+        let about = adw::PreferencesGroup::builder().title("About").build();
+        let version = adw::ActionRow::builder().title("betterAC").subtitle(ac_core::VERSION).build();
+        version.add_css_class("property");
+        about.add(&version);
+
+        let status = adw::ActionRow::builder().title("Checking for updates…").build();
+        let spinner = gtk::Spinner::new();
+        spinner.start();
+        status.add_suffix(&spinner);
+        let install = gtk::Button::with_label("Install");
+        install.add_css_class("suggested-action");
+        install.set_valign(gtk::Align::Center);
+        install.set_visible(false);
+        status.add_suffix(&install);
+        about.add(&status);
+        page.add(&about);
+
+        let (tx, rx) = async_channel::bounded(1);
+        gio::spawn_blocking(move || {
+            let _ = tx.send_blocking(ac_core::update::status());
+        });
+
+        let ui = self.clone();
+        let (row, btn, spin) = (status.clone(), install.clone(), spinner.clone());
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else { return };
+            spin.stop();
+            row.remove(&spin);
+            match result {
+                Err(e) => {
+                    row.set_title("Could not check for updates");
+                    row.set_subtitle(&e);
+                }
+                Ok(s) => match s.available {
+                    None => row.set_title("Up to date"),
+                    Some(release) => {
+                        row.set_title(&format!("Update available: {}", release.version));
+                        if s.source == "homebrew" {
+                            // Replacing a brew-managed copy behind brew's back
+                            // leaves its receipt describing a version that is no
+                            // longer on disk. Tell, do not do.
+                            row.set_subtitle("Installed by Homebrew — run: brew upgrade --cask betterac");
+                        } else {
+                            row.set_subtitle("Downloads and replaces this copy");
+                            btn.set_visible(true);
+                            btn.connect_clicked(move |btn| {
+                                ui.clone().install_update(btn.clone(), row.clone());
+                            });
+                        }
+                    }
+                },
+            }
+        });
+    }
+
+    /// Download and install the newest release, off the main thread.
+    ///
+    /// On Linux this replaces the binary by renaming over it, so *this* process is
+    /// unaffected and keeps running the old code — hence "restart to use it"
+    /// rather than anything more dramatic.
+    fn install_update(self: Rc<Self>, btn: gtk::Button, row: adw::ActionRow) {
+        btn.set_sensitive(false);
+        row.set_subtitle("Downloading…");
+
+        let (tx, rx) = async_channel::bounded(1);
+        gio::spawn_blocking(move || {
+            let _ = tx.send_blocking(ac_core::update::update_now(&mut |_| {}));
+        });
+
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(result) = rx.recv().await else { return };
+            match result {
+                Ok(Some(_)) => {
+                    btn.set_visible(false);
+                    row.set_title("Update installed");
+                    row.set_subtitle("Restart betterAC to use it");
+                    ui.toast("Update installed — restart betterAC to use it.");
+                }
+                Ok(None) => {
+                    btn.set_visible(false);
+                    row.set_title("Up to date");
+                    row.set_subtitle("");
+                }
+                Err(e) => {
+                    btn.set_sensitive(true);
+                    row.set_subtitle(&e);
+                    ui.toast(&e);
+                }
+            }
+        });
     }
 
     /// The Decal settings: a master switch and a row per registered plugin, then a

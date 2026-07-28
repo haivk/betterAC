@@ -27,6 +27,7 @@ pub mod reset;
 pub mod runtime;
 pub mod servers;
 pub mod setup;
+pub mod update;
 
 /// The macOS Wine runtime. Compiled only on macOS: it self-provisions a
 /// CrossOver-lineage Wine engine and runs the 32-bit client under Rosetta 2,
@@ -35,3 +36,18 @@ pub mod setup;
 pub mod wine;
 
 pub use install::{default_prefix, runtime_dir, steam_compat, support_dir, Install};
+
+/// The version of this build.
+///
+/// Released builds are dated -- `2026.07.27.42` -- which is four components and so
+/// cannot be a crate version, since Cargo requires semver `X.Y.Z`. CI passes the
+/// real one in at compile time as `BETTERAC_VERSION`; a local build falls back to
+/// the workspace version, which is why a dev build reads as `0.1.0` and always
+/// looks older than any release.
+///
+/// `build.rs` tells Cargo to watch that variable, or a cached build would keep
+/// reporting a stale version.
+pub const VERSION: &str = match option_env!("BETTERAC_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};

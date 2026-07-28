@@ -18,10 +18,11 @@
 resolver = "2"
 members = ["core", "gtk", "ffi"]
 
-# One version for the whole workspace, inherited by every crate. Releases are cut
-# from a git tag, and the release workflow refuses to build when the tag and this
-# disagree -- otherwise the Homebrew cask, the PKGBUILD and the AppStream
-# <release> entry all quietly describe a different build than the binary they ship.
+# One version for the whole workspace, inherited by every crate. Versioned
+# releases are cut from a git tag, and the release workflow refuses to build when
+# the tag and this disagree -- otherwise the Homebrew cask would quietly describe
+# a different build than the binary it ships. Pushes to main are built too, as a
+# rolling prerelease, and carry whatever version is set here.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

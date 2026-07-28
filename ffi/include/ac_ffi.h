@@ -161,6 +161,23 @@ char *ac_decal_install_plugin(const char *path);
 // unconditional, which meant quitting the launcher mid-session killed the game.
 void ac_decal_shutdown(void);
 
+// What is running, what is available, and who owns updating this copy — as
+// `ac_core::update::Status` JSON. On failure the JSON carries an `error` key
+// instead, because being unable to reach GitHub is not a reason for the settings
+// panel to show nothing.
+//
+// This makes a network request; call it off the main thread.
+char *ac_update_status(void);
+
+// Download and install the newest release. Blocking and slow — call it off the
+// main thread.
+//
+// Returns JSON: `{"quit":true}` when the app must exit *now* for a helper to swap
+// the bundle, `{"quit":false}` when the new version is already on disk and will be
+// picked up on the next launch, `{"uptodate":true}` when there was nothing to do,
+// or `{"error":"…"}`.
+char *ac_update_install(void);
+
 // Free a string returned by any of the `*_json` / `*_get` / `ac_detect` /
 // `ac_setup_poll` / `ac_config_set` / `ac_launch` calls. Null is ignored. Never
 // call this on `ac_core_version`'s result.
