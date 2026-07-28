@@ -17,6 +17,7 @@ pub mod args;
 pub mod clrmeta;
 pub mod config;
 pub mod decal;
+pub mod deps;
 pub mod fetch;
 pub mod gamefiles;
 pub mod install;

@@ -41,11 +41,7 @@ fn gamescope_enabled() -> bool {
     on_path("gamescope")
 }
 
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-        .unwrap_or(false)
-}
+use crate::deps::on_path;
 
 /// BETTERAC_GAMESCOPE_ARGS replaces the lot -- including the detected resolution.
 /// If you set it, you are driving, and the obvious reason to set it is to render
@@ -126,11 +122,17 @@ pub fn launch(
 
     cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "{} is not installed. On Bazzite: rpm-ostree install {}",
-                inv.program,
-                if inv.program == "gamescope" { "gamescope" } else { "umu-launcher" }
-            )
+            {
+                let pkg = if inv.program == "gamescope" { "gamescope" } else { "umu-launcher" };
+                match crate::deps::detect() {
+                    Some(mgr) => format!(
+                        "{} is not installed. Install it with:\n  {}",
+                        inv.program,
+                        crate::deps::install_command(&mgr, &[pkg], crate::deps::escalator()).join(" ")
+                    ),
+                    None => format!("{} is not installed -- install the {pkg} package.", inv.program),
+                }
+            }
         } else {
             format!("Could not start the client: {e}")
         }
@@ -306,33 +308,106 @@ impl ProtonRuntime {
         c
     }
 
+    /// Make sure the host tools are present, installing what is missing.
+    ///
+    /// Only `umu-run` is required; `gamescope` is recommended and its absence is a
+    /// warning, not a failure. `winetricks` is not checked at all any more — Decal
+    /// runs a bundled copy, and the step that used the host one is gone, so
+    /// demanding it only ever failed setups that would have worked. See
+    /// [`crate::deps`].
     fn step_dependencies(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
-        // Bazzite is atomic: we cannot install host tools, so we can only check and
-        // hand back the rpm-ostree line. curl/unzip/cabextract are no longer needed
-        // -- we do those in-process now -- so only the true runtime tools remain.
-        let mut missing: Vec<&str> = Vec::new();
-        for (bin, pkg) in [
-            ("umu-run", "umu-launcher"),
-            ("gamescope", "gamescope"),
-            ("winetricks", "winetricks"),
-        ] {
-            if !on_path(bin) {
-                missing.push(pkg);
-            }
-        }
+        use crate::deps;
+
+        let missing: Vec<deps::Tool> =
+            deps::TOOLS.iter().copied().filter(|t| !deps::on_path(t.bin)).collect();
         if missing.is_empty() {
-            on(Progress::skipped(
-                SetupStep::Dependencies,
-                "umu-run, gamescope and winetricks are all present",
-            ));
+            on(Progress::skipped(SetupStep::Dependencies, "umu-run and gamescope are both present"));
             return Ok(());
         }
-        Err(format!(
-            "Missing host tools: {}.\n\nBazzite is atomic, so these go on the host image:\n  \
-             rpm-ostree install {} && systemctl reboot\n\n(umu-run and gamescope normally ship with Bazzite already.)",
-            missing.join(", "),
-            missing.join(" ")
-        ))
+
+        let names = |ts: &[deps::Tool]| {
+            ts.iter().map(|t| t.bin).collect::<Vec<_>>().join(", ")
+        };
+
+        if std::env::var("BETTERAC_NO_DEPS").is_ok_and(|v| v == "1") {
+            return Err(manual_instructions(&missing, "BETTERAC_NO_DEPS=1 is set"));
+        }
+
+        match deps::detect() {
+            None => Err(manual_instructions(&missing, "no supported package manager was found")),
+            Some(mgr) => {
+                // Only what this distro actually packages; the rest is explained.
+                let packages: Vec<&str> =
+                    missing.iter().filter_map(|t| deps::package(&mgr, *t)).collect();
+                if packages.is_empty() {
+                    return Err(manual_instructions(&missing, "your distro does not package them"));
+                }
+
+                on(Progress::new(
+                    SetupStep::Dependencies,
+                    0.3,
+                    format!("installing {} with {} (you may be asked for your password)…", packages.join(" and "), mgr.name),
+                ));
+                let attempt = deps::install(&mgr, &packages);
+
+                // An image-based host layers the package into the *next* boot, so
+                // even a successful install leaves this one unable to continue.
+                if attempt.is_ok() && mgr.reboot_required {
+                    return Err(format!(
+                        "Installed {} — reboot to finish, then run setup again.\n\n  \
+                         systemctl reboot",
+                        packages.join(" and ")
+                    ));
+                }
+                // Believe the filesystem, not the exit code -- and judge by what is
+                // still missing, not by whether the installer was happy. A failure
+                // that leaves only *optional* tools absent is not a failed setup:
+                // gamescope is a nicety, and refusing to install the game because
+                // the host could not supply it would be absurd.
+                let still: Vec<deps::Tool> =
+                    missing.iter().copied().filter(|t| !deps::on_path(t.bin)).collect();
+
+                if still.iter().any(|t| t.required) {
+                    let why = match &attempt {
+                        Err(e) => format!("could not install them: {e}"),
+                        Ok(()) => "the install reported success but they are still missing".into(),
+                    };
+                    // pacman's "target not found" for umu-launcher is almost always
+                    // multilib being disabled. Only say so when umu-launcher was
+                    // actually one of the packages -- the same error about gamescope
+                    // means something else entirely.
+                    let multilib = matches!(&attempt, Err(e)
+                        if mgr.name == "pacman"
+                            && e.contains("target not found")
+                            && packages.contains(&"umu-launcher"));
+                    let hint = if multilib {
+                        "\n       umu-launcher lives in the multilib repository. Enable it by \
+                         uncommenting\n       the [multilib] section in /etc/pacman.conf, then run: \
+                         sudo pacman -Sy\n"
+                    } else {
+                        ""
+                    };
+                    return Err(format!("{}{hint}", manual_instructions(&still, &why)));
+                }
+                if still.is_empty() {
+                    on(Progress::new(
+                        SetupStep::Dependencies,
+                        1.0,
+                        format!("installed {}", packages.join(" and ")),
+                    ));
+                } else {
+                    on(Progress::new(
+                        SetupStep::Dependencies,
+                        1.0,
+                        format!(
+                            "continuing without {} — optional; the game runs, just without its scaling",
+                            names(&still)
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn step_download_runtime(&self, on: &mut dyn FnMut(Progress)) -> Result<(), String> {
@@ -685,6 +760,45 @@ fn umu_hint(log: &str) -> &'static str {
      tar -xJf /tmp/slr.tar.xz -C /tmp\n  \
      rm -rf ~/.local/share/umu/steamrt3 && mv /tmp/SteamLinuxRuntime_sniper ~/.local/share/umu/steamrt3\n  \
      touch ~/.local/share/umu/steamrt3/.installed.ok"
+}
+
+/// What to tell someone who has to install the tools themselves.
+///
+/// Distribution-neutral on purpose: betterAC started out Bazzite-only and the old
+/// message hardcoded `rpm-ostree`, which is wrong everywhere else and actively
+/// confusing on Arch.
+fn manual_instructions(missing: &[crate::deps::Tool], why: &str) -> String {
+    use crate::deps;
+    let required: Vec<&str> =
+        missing.iter().filter(|t| t.required).map(|t| t.bin).collect();
+    if required.is_empty() {
+        // Nothing required is missing; the caller should not have failed at all.
+        return String::new();
+    }
+    let mgr = deps::detect();
+    let mut msg = format!("Missing: {} ({why}).\n", required.join(", "));
+    if let Some(mgr) = &mgr {
+        let pkgs: Vec<&str> = missing.iter().filter_map(|t| deps::package(mgr, *t)).collect();
+        if !pkgs.is_empty() {
+            msg.push_str(&format!(
+                "\n       Install with:\n         {}\n",
+                deps::install_command(mgr, &pkgs, deps::escalator()).join(" ")
+            ));
+        }
+    }
+    // The "get it from upstream" pointer belongs only to tools this distro really
+    // does not carry. Printing it next to a working `pacman -S umu-launcher` would
+    // be flatly untrue.
+    for t in missing.iter().filter(|t| t.required) {
+        if mgr.as_ref().and_then(|m| deps::package(m, *t)).is_some() {
+            continue;
+        }
+        let hint = deps::manual_hint(*t);
+        if !hint.is_empty() {
+            msg.push_str(&format!("\n       {hint}\n"));
+        }
+    }
+    msg
 }
 
 /// A path's last component, for progress messages.

@@ -77,7 +77,7 @@ pub(crate) fn check_cancelled() -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupStep {
-    /// Host tools that must already be present (umu-run/gamescope on Bazzite;
+    /// Host tools the launcher drives (umu-run, and gamescope if available;
     /// Rosetta 2 on macOS, which we can install). Re-checked every run.
     Dependencies,
     /// Download the Windows runtime: GE-Proton (Linux) or the Wine engine (macOS).
@@ -90,7 +90,8 @@ pub enum SetupStep {
     InstallRuntime,
     /// Create the Wine/Proton prefix.
     Prefix,
-    /// Extra runtime components: winetricks vcrun2019 + VC++ 2005 on Linux;
+    /// Extra runtime components. A no-op on both platforms now -- the client's
+    /// C runtimes ship inside the game files, and Decal installs what it needs;
     /// nothing on macOS, where they arrive inside ac-updates.zip.
     Components,
     /// Run the real ac1install.exe wizard. Deliberately not silent.
@@ -148,7 +149,7 @@ impl SetupStep {
     /// its live message replaces this.
     pub fn detail(&self) -> &'static str {
         match self {
-            SetupStep::Dependencies => "System requirements and host tools",
+            SetupStep::Dependencies => "Checking for umu-run, and installing it if missing",
             SetupStep::DownloadRuntime => "The compatibility layer that runs Windows games",
             SetupStep::DownloadClient => "The original retail installer, about 570 MB",
             SetupStep::DownloadUpdates => "Data files and the patched client, about 480 MB",
