@@ -435,14 +435,26 @@ impl ProtonRuntime {
         std::fs::create_dir_all(&self.prefix).map_err(|e| e.to_string())?;
         on(Progress::new(SetupStep::Prefix, 0.2, "initialising win64 prefix (first run is slow)…"));
         // wineboot first; fall back to cmd /c exit, exactly as the script did.
-        let _ = self.umu(&proton, "umu-run", WAIT).args(["wineboot", "--init"]).status();
+        //
+        // Output is captured rather than inherited so that a failure can say *why*.
+        // This step used to discard it and report only "no drive_c", which is the
+        // one thing the user can already see and the one thing they cannot act on:
+        // when umu cannot provision its own runtime it explains itself perfectly
+        // well, and that explanation was being thrown away.
+        let boot = self.umu(&proton, "umu-run", WAIT).args(["wineboot", "--init"]).output();
+        let mut log = boot.as_ref().map(|o| stderr_tail(&o.stderr)).unwrap_or_default();
         if !self.prefix.join("drive_c").is_dir() {
-            let _ = self.umu(&proton, "umu-run", WAIT).args(["cmd", "/c", "exit"]).status();
+            let retry = self.umu(&proton, "umu-run", WAIT).args(["cmd", "/c", "exit"]).output();
+            if let Ok(o) = &retry {
+                log = stderr_tail(&o.stderr);
+            }
         }
         if !self.prefix.join("drive_c").is_dir() {
             return Err(format!(
-                "prefix creation failed -- no drive_c at {}",
-                self.prefix.join("drive_c").display()
+                "prefix creation failed -- no drive_c at {}{}{}",
+                self.prefix.join("drive_c").display(),
+                umu_hint(&log),
+                if log.is_empty() { String::new() } else { format!("\n\numu-run said:\n{log}") },
             ));
         }
         mark_stamped(&self.prefix, SetupStep::Prefix).map_err(|e| e.to_string())?;
@@ -634,6 +646,46 @@ impl Runtime for ProtonRuntime {
 }
 
 // ----------------------------------------------------------------- setup helpers
+
+/// The last few lines of a captured stderr, which is where the actual complaint
+/// lives -- umu is voluminous and the useful part is always at the end.
+fn stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            // Drop the Python traceback scaffolding; keep the exception text.
+            !l.is_empty()
+                && !l.starts_with("Traceback")
+                && !l.trim_start().starts_with("File \"")
+                && !l.trim_start().starts_with('^')
+                && !l.trim_start().starts_with('~')
+        })
+        .collect();
+    lines.iter().rev().take(6).rev().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// A pointer at the fix for the umu failure that is not the user's fault.
+///
+/// umu installs its Steam Linux Runtime from a channel URL that Valve now answers
+/// with 403 (`steamrt3/images/latest-public-beta/SHA256SUMS`, seen on umu 1.4.0),
+/// so a machine whose `~/.local/share/umu` has been emptied cannot set itself up
+/// again -- while a machine that still has the runtime works fine, because the
+/// same 403 is only logged during the update check. Fetching by build id still
+/// works, so say so rather than leaving "no drive_c" as the whole story.
+fn umu_hint(log: &str) -> &'static str {
+    if !log.contains("has not been setup") && !log.contains("403") {
+        return "";
+    }
+    "\n\numu could not install its runtime -- this is an upstream umu/Valve issue, \
+     not your setup.\nRestore it with:\n  \
+     B=$(curl -s https://repo.steampowered.com/steamrt3/images/latest-container-runtime-public-beta.txt)\n  \
+     curl -fL -o /tmp/slr.tar.xz \"https://repo.steampowered.com/steamrt3/images/$B/SteamLinuxRuntime_sniper.tar.xz\"\n  \
+     tar -xJf /tmp/slr.tar.xz -C /tmp\n  \
+     rm -rf ~/.local/share/umu/steamrt3 && mv /tmp/SteamLinuxRuntime_sniper ~/.local/share/umu/steamrt3\n  \
+     touch ~/.local/share/umu/steamrt3/.installed.ok"
+}
 
 /// A path's last component, for progress messages.
 fn name_of(p: &Path) -> String {

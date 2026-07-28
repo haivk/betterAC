@@ -142,7 +142,26 @@ add "$HOME/acinstaller"                                                      "ol
 # --- shared, --deep only ------------------------------------------------------
 add_shared "$HOME/.cache/acinstaller"    "downloaded installers (re-downloaded on next setup)"
 add_shared "$HOME/.cache/winetricks"     "winetricks cache -- shared with any other Wine app"
-add_shared "$HOME/.local/share/umu"      "umu runtime -- shared with any other umu/Proton game"
+
+# NOT offered, not even under --deep: ~/.local/share/umu.
+#
+# It looks like a cache and is not. It holds umu's Steam Linux Runtime, and umu
+# can only reinstall it from a channel URL that Valve currently answers with 403
+# (`repo.steampowered.com/steamrt3/images/latest-public-beta/SHA256SUMS`, umu
+# 1.4.0). Delete it and *every* umu game on the machine stops working, with
+# "umu has not been setup for the user" and no way back through umu itself --
+# measured on Bazzite 2026-07-28 after this script removed it.
+#
+# Recovering means fetching the runtime by build id, which still works:
+#   B=$(curl -s https://repo.steampowered.com/steamrt3/images/latest-container-runtime-public-beta.txt)
+#   curl -fL -o /tmp/slr.tar.xz \
+#     "https://repo.steampowered.com/steamrt3/images/$B/SteamLinuxRuntime_sniper.tar.xz"
+#   tar -xJf /tmp/slr.tar.xz -C /tmp
+#   rm -rf ~/.local/share/umu/steamrt3
+#   mv /tmp/SteamLinuxRuntime_sniper ~/.local/share/umu/steamrt3
+#   touch ~/.local/share/umu/steamrt3/.installed.ok
+#
+# betterAC re-downloads GE-Proton by itself, so that one is safe to offer below.
 while IFS= read -r d; do
   add_shared "$d" "GE-Proton in Steam's tools -- other Steam games may use it"
 done < <(find "$HOME/.local/share/Steam/compatibilitytools.d" -maxdepth 1 -name 'GE-Proton*' 2>/dev/null || true)
